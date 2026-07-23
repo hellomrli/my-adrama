@@ -4,19 +4,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Color32, RichText, TextureHandle, Vec2};
+use egui::{Color32, RichText, Sense, TextureHandle, Vec2};
 
+use super::theme;
 use super::worker::{Job, WorkerHandle, WorkerMsg};
 use super::workflow::{WfAction, WfNodeKind, WorkflowCanvas};
 use crate::model::{Breakdown, ItemStatus};
-use crate::project::{Project, ProjectConfig, ProviderKind, Stage, StageStatus};
+use crate::project::{
+    EndpointMode, Project, ProjectConfig, ProviderKind, Stage, StageStatus, GOOGLE_OFFICIAL_BASE,
+    OPENAI_OFFICIAL_BASE, XAI_OFFICIAL_BASE,
+};
 use crate::settings::AppSettings;
 use crate::stages;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Home,
     Workflow,
-    Overview,
     Script,
     Parse,
     Assets,
@@ -25,10 +29,18 @@ enum Tab {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPane {
+    Keys,
+    Routing,
+    Project,
+}
+
 pub struct AdramaApp {
     worker: WorkerHandle,
     project: Option<Project>,
     tab: Tab,
+    settings_pane: SettingsPane,
     busy: bool,
     busy_label: String,
     busy_kind: Option<WfNodeKind>,
@@ -57,7 +69,6 @@ pub struct AdramaApp {
     settings_dirty: bool,
 
     workflow: WorkflowCanvas,
-
     textures: HashMap<PathBuf, TextureHandle>,
     last_refresh: Instant,
     refresh_interval: Duration,
@@ -70,13 +81,7 @@ pub struct AdramaApp {
 }
 
 impl AdramaApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: PathBuf) -> Self {
-        // dark-ish professional theme
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        cc.egui_ctx.set_style(style);
-
+    pub fn new(_cc: &eframe::CreationContext<'_>, initial: PathBuf) -> Self {
         let mut app_settings = AppSettings::load();
         app_settings.merge_from_env();
         app_settings.apply_to_env();
@@ -84,13 +89,14 @@ impl AdramaApp {
         let mut app = Self {
             worker: WorkerHandle::spawn(),
             project: None,
-            tab: Tab::Workflow,
+            tab: Tab::Home,
+            settings_pane: SettingsPane::Keys,
             busy: false,
             busy_label: String::new(),
             busy_kind: None,
             progress: None,
             logs: Vec::new(),
-            status_msg: "打开或新建项目以开始。".into(),
+            status_msg: "欢迎使用 my-adrama".into(),
             error_msg: String::new(),
             preview_image: None,
             script_path: None,
@@ -122,11 +128,7 @@ impl AdramaApp {
         let try_path = if initial.join("project.toml").exists() {
             Some(initial)
         } else if let Some(last) = app.app_settings.last_project.clone() {
-            if last.join("project.toml").exists() {
-                Some(last)
-            } else {
-                None
-            }
+            last.join("project.toml").exists().then_some(last)
         } else if initial == Path::new(".") {
             std::env::current_dir()
                 .ok()
@@ -137,7 +139,6 @@ impl AdramaApp {
         if let Some(p) = try_path {
             app.open_project(&p);
         }
-
         app
     }
 
@@ -192,7 +193,9 @@ impl AdramaApp {
 
     fn reload_project(&mut self) {
         if let Some(root) = self.project.as_ref().map(|p| p.root.clone()) {
+            let keep_tab = self.tab;
             self.open_project(&root);
+            self.tab = keep_tab;
         }
     }
 
@@ -201,7 +204,6 @@ impl AdramaApp {
             self.error_msg = "已有任务在运行中".into();
             return;
         }
-        // Connection tests may run without a project; use cwd as dummy root
         let root = if matches!(job, Job::TestEndpoint { .. }) {
             self.project
                 .as_ref()
@@ -265,7 +267,6 @@ impl AdramaApp {
                         self.push_log(format!("✗ {message}"));
                         self.status_msg = "任务失败".into();
                     }
-                    // Avoid wiping in-progress script edits on test-endpoint finish
                     if !message.contains("端点") {
                         self.reload_project();
                     }
@@ -281,13 +282,11 @@ impl AdramaApp {
         self.last_refresh = Instant::now();
         let Some(proj) = self.project.as_ref() else {
             self.breakdown_text.clear();
-            self.script_text.clear();
             self.asset_thumbs.clear();
             self.storyboard_thumbs.clear();
             self.video_files.clear();
             return;
         };
-
         if !self.script_dirty {
             match proj.find_script() {
                 Ok(p) => {
@@ -298,19 +297,17 @@ impl AdramaApp {
                 Err(_) => {
                     self.script_path = None;
                     if self.script_text.is_empty() || self.script_text.starts_with('（') {
-                        self.script_text = "（尚未导入剧本 — 可直接在此输入并保存）".into();
+                        self.script_text = "（尚未导入剧本 — 可直接输入并保存）".into();
                     }
                 }
             }
         }
-
         if proj.parsed_path().exists() {
             self.breakdown_text = fs::read_to_string(proj.parsed_path())
                 .unwrap_or_else(|e| format!("（读取失败：{e}）"));
         } else {
             self.breakdown_text = "（请先运行「解析」生成 breakdown.json）".into();
         }
-
         self.asset_thumbs = collect_images(&proj.assets_dir());
         self.storyboard_thumbs = collect_images(&proj.storyboard_dir());
         self.video_files = collect_ext(&proj.video_dir(), &["mp4", "webm", "mov"]);
@@ -320,10 +317,7 @@ impl AdramaApp {
         self.app_settings.apply_to_env();
         match self.app_settings.save() {
             Ok(()) => {
-                self.status_msg = format!(
-                    "已保存全局设置 → {}",
-                    AppSettings::config_path().display()
-                );
+                self.status_msg = format!("密钥已保存 → {}", AppSettings::config_path().display());
                 self.settings_dirty = false;
             }
             Err(e) => self.error_msg = format!("{e:#}"),
@@ -355,11 +349,36 @@ impl AdramaApp {
             match stages::import::run(proj, &path) {
                 Ok(()) => {
                     self.status_msg = format!("已导入 {}", path.display());
+                    self.script_dirty = false;
                     self.refresh_caches(true);
                     self.tab = Tab::Script;
                 }
                 Err(e) => self.error_msg = format!("{e:#}"),
             }
+        }
+    }
+
+    fn save_script(&mut self) {
+        let Some(proj) = self.project.as_ref() else {
+            return;
+        };
+        let path = if let Some(p) = self.script_path.clone() {
+            p
+        } else {
+            let dir = proj.script_dir();
+            if let Err(e) = fs::create_dir_all(&dir) {
+                self.error_msg = format!("创建 script 目录失败: {e}");
+                return;
+            }
+            dir.join("script.md")
+        };
+        match fs::write(&path, &self.script_text) {
+            Ok(()) => {
+                self.script_path = Some(path.clone());
+                self.script_dirty = false;
+                self.status_msg = format!("剧本已保存 → {}", path.display());
+            }
+            Err(e) => self.error_msg = format!("保存失败: {e}"),
         }
     }
 
@@ -371,11 +390,7 @@ impl AdramaApp {
         let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-        let tex = ctx.load_texture(
-            path.to_string_lossy(),
-            color,
-            egui::TextureOptions::LINEAR,
-        );
+        let tex = ctx.load_texture(path.to_string_lossy(), color, egui::TextureOptions::LINEAR);
         self.textures.insert(path.to_path_buf(), tex.clone());
         Some(tex)
     }
@@ -420,6 +435,55 @@ impl AdramaApp {
             WfAction::Approve(stage) => self.submit(Job::Approve { stage }),
         }
     }
+
+    fn resolved_key_url_for_test(
+        &self,
+        family: ProviderKind,
+    ) -> (String, String, String, EndpointMode) {
+        match family {
+            ProviderKind::OpenAi => {
+                let mode = self.edit_config.openai_mode;
+                let url = match mode {
+                    EndpointMode::Official => OPENAI_OFFICIAL_BASE.to_string(),
+                    EndpointMode::Custom => self.edit_config.openai_custom_base_url.clone(),
+                };
+                let key = match mode {
+                    EndpointMode::Official => self.app_settings.openai_official_key.clone(),
+                    EndpointMode::Custom => self.app_settings.openai_custom_key.clone(),
+                };
+                (
+                    "OpenAI / Image2".into(),
+                    url,
+                    key,
+                    mode,
+                )
+            }
+            ProviderKind::Google => {
+                let mode = self.edit_config.google_mode;
+                let url = match mode {
+                    EndpointMode::Official => GOOGLE_OFFICIAL_BASE.to_string(),
+                    EndpointMode::Custom => self.edit_config.google_custom_base_url.clone(),
+                };
+                let key = match mode {
+                    EndpointMode::Official => self.app_settings.google_official_key.clone(),
+                    EndpointMode::Custom => self.app_settings.google_custom_key.clone(),
+                };
+                ("Google / Veo".into(), url, key, mode)
+            }
+            ProviderKind::Xai => {
+                let mode = self.edit_config.xai_mode;
+                let url = match mode {
+                    EndpointMode::Official => XAI_OFFICIAL_BASE.to_string(),
+                    EndpointMode::Custom => self.edit_config.xai_custom_base_url.clone(),
+                };
+                let key = match mode {
+                    EndpointMode::Official => self.app_settings.xai_official_key.clone(),
+                    EndpointMode::Custom => self.app_settings.xai_custom_key.clone(),
+                };
+                ("xAI / Grok".into(), url, key, mode)
+            }
+        }
+    }
 }
 
 impl eframe::App for AdramaApp {
@@ -430,398 +494,421 @@ impl eframe::App for AdramaApp {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("adrama").strong());
-                ui.label(RichText::new("AI 短剧工作流").weak());
-                ui.separator();
-                if ui.button("打开项目…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.open_project(&path);
-                    }
-                }
-                if ui.button("新建项目").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.create_parent = path;
-                    }
-                    self.tab = Tab::Overview;
-                }
-                if ui
-                    .add_enabled(self.project.is_some(), egui::Button::new("重新加载"))
-                    .clicked()
-                {
-                    self.reload_project();
-                }
-                ui.separator();
-                if let Some(p) = self.project.as_ref() {
-                    ui.label(
-                        RichText::new(format!("{}  ·  {}", p.config.name, p.root.display()))
-                            .strong(),
-                    );
-                } else {
-                    ui.label(RichText::new("未打开项目").weak());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.busy {
-                        if ui
-                            .button(RichText::new("取消任务").color(Color32::from_rgb(255, 120, 120)))
-                            .clicked()
-                        {
-                            self.worker.cancel();
-                            self.push_log("… 正在请求取消");
-                        }
-                        ui.spinner();
-                        ui.colored_label(Color32::LIGHT_BLUE, &self.busy_label);
-                        if let Some((c, t, _)) = &self.progress {
-                            if *t > 0 {
-                                ui.add(
-                                    egui::ProgressBar::new(*c as f32 / *t as f32)
-                                        .desired_width(120.0)
-                                        .text(format!("{c}/{t}")),
-                                );
-                            }
-                        }
-                    }
-                    ui.checkbox(&mut self.dry_run, "演练模式 Dry-run");
-                });
-            });
-            ui.add_space(2.0);
-        });
+        self.ui_top_bar(ctx);
+        self.ui_status_bar(ctx);
+        self.ui_side_rail(ctx);
 
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            if !self.error_msg.is_empty() {
-                ui.colored_label(Color32::from_rgb(230, 90, 90), &self.error_msg);
-            }
-            ui.horizontal(|ui| {
-                ui.label(&self.status_msg);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("设置可配置 Image2 / Omni·Veo / Grok 的 URL 与 Key")
-                            .small()
-                            .weak(),
-                    );
-                });
-            });
-        });
-
-        egui::SidePanel::left("nav")
-            .resizable(true)
-            .default_width(200.0)
-            .show(ctx, |ui| {
-                ui.heading("导航");
-                ui.separator();
-                self.nav_button(ui, Tab::Workflow, "◈  工作流画布");
-                self.nav_button(ui, Tab::Overview, "⌂  项目总览");
-                self.nav_button(ui, Tab::Script, "✎  剧本");
-                self.nav_button(ui, Tab::Parse, "1  解析");
-                self.nav_button(ui, Tab::Assets, "2  资产");
-                self.nav_button(ui, Tab::Storyboard, "3  分镜");
-                self.nav_button(ui, Tab::Video, "4  视频");
-                self.nav_button(ui, Tab::Settings, "⚙  设置");
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(RichText::new("流水线状态").strong());
-                if let Some(proj) = self.project.as_ref() {
-                    for stage in Stage::all() {
-                        let st = proj.state.get(*stage);
-                        let (mark, color) = match st {
-                            StageStatus::Pending => ("○", Color32::GRAY),
-                            StageStatus::InProgress => ("…", Color32::LIGHT_BLUE),
-                            StageStatus::Done => ("●", Color32::from_rgb(100, 200, 100)),
-                            StageStatus::Approved => ("★", Color32::from_rgb(240, 200, 40)),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.colored_label(color, mark);
-                            ui.label(stage_zh(*stage));
-                            ui.label(
-                                RichText::new(status_zh(st)).small().weak(),
-                            );
-                        });
-                    }
-                } else {
-                    ui.label(RichText::new("—").weak());
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                if let Some(proj) = self.project.as_ref() {
-                    if ui.button("打开项目文件夹").clicked() {
-                        open_path(&proj.root);
-                    }
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("运行日志").strong());
-                    if ui.small_button("清空").clicked() {
-                        self.logs.clear();
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &self.logs {
-                            ui.label(RichText::new(line).small().monospace());
-                        }
-                    });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| match self.tab {
+                Tab::Home => self.ui_home(ui),
+                Tab::Workflow => self.ui_workflow(ui),
+                Tab::Script => self.ui_script(ui),
+                Tab::Parse => self.ui_parse(ui),
+                Tab::Assets => self.ui_assets(ui, ctx),
+                Tab::Storyboard => self.ui_storyboard(ui, ctx),
+                Tab::Video => self.ui_video(ui),
+                Tab::Settings => self.ui_settings(ui),
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Workflow => self.ui_workflow(ui),
-            Tab::Overview => self.ui_overview(ui),
-            Tab::Script => self.ui_script(ui),
-            Tab::Parse => self.ui_parse(ui),
-            Tab::Assets => self.ui_assets(ui, ctx),
-            Tab::Storyboard => self.ui_storyboard(ui, ctx),
-            Tab::Video => self.ui_video(ui),
-            Tab::Settings => self.ui_settings(ui),
-        });
-
-        // Lightbox preview
-        if self.preview_image.is_some() {
-            let mut open = true;
-            egui::Window::new("图片预览")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(true)
-                .default_size([720.0, 520.0])
-                .show(ctx, |ui| {
-                    if let Some(path) = self.preview_image.clone() {
-                        ui.label(path.display().to_string());
-                        ui.separator();
-                        if let Some(tex) = self.texture_for(ctx, &path) {
-                            let avail = ui.available_size();
-                            let size = tex.size_vec2();
-                            let scale = (avail.x / size.x)
-                                .min(avail.y / size.y)
-                                .min(1.0)
-                                .max(0.1);
-                            ui.image((tex.id(), size * scale));
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("用系统程序打开").clicked() {
-                                open_path(&path);
-                            }
-                            if ui.button("关闭").clicked() {
-                                self.preview_image = None;
-                            }
-                        });
-                    }
-                });
-            if !open {
-                self.preview_image = None;
-            }
-        }
+        self.ui_preview_window(ctx);
     }
 }
 
 impl AdramaApp {
-    fn nav_button(&mut self, ui: &mut egui::Ui, tab: Tab, label: &str) {
-        if ui.selectable_label(self.tab == tab, label).clicked() {
+    fn ui_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top")
+            .exact_height(52.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        RichText::new("my-adrama")
+                            .strong()
+                            .size(18.0)
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(RichText::new("AI 短剧工作流").color(theme::TEXT_MUTED));
+                    ui.separator();
+
+                    if ui.button("打开").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.open_project(&path);
+                        }
+                    }
+                    if ui.button("新建").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.create_parent = path;
+                        }
+                        self.tab = Tab::Home;
+                    }
+                    if ui
+                        .add_enabled(self.project.is_some(), egui::Button::new("刷新"))
+                        .clicked()
+                    {
+                        self.reload_project();
+                    }
+
+                    if let Some(p) = self.project.as_ref() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("📁 {}", p.config.name))
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(p.root.display().to_string())
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.dry_run, "演练 Dry-run");
+                        if self.busy {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("取消").color(theme::DANGER),
+                                    )
+                                    .fill(Color32::from_rgb(50, 28, 32)),
+                                )
+                                .clicked()
+                            {
+                                self.worker.cancel();
+                                self.push_log("… 正在请求取消");
+                            }
+                            ui.spinner();
+                            ui.colored_label(theme::INFO, &self.busy_label);
+                            if let Some((c, t, _)) = &self.progress {
+                                if *t > 0 {
+                                    ui.add(
+                                        egui::ProgressBar::new(*c as f32 / *t as f32)
+                                            .desired_width(100.0)
+                                            .text(format!("{c}/{t}")),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("bottom")
+            .exact_height(if self.error_msg.is_empty() { 32.0 } else { 52.0 })
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(16, 6)),
+            )
+            .show(ctx, |ui| {
+                if !self.error_msg.is_empty() {
+                    ui.colored_label(theme::DANGER, &self.error_msg);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.status_msg).color(theme::TEXT_MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(p) = self.project.as_ref() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "对话 {} · 图像 {} · 视频 {}",
+                                    p.config.chat_provider.label_zh(),
+                                    p.config.image_provider.label_zh(),
+                                    p.config.video_provider.label_zh(),
+                                ))
+                                .small()
+                                .color(theme::TEXT_DIM),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_side_rail(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("rail")
+            .exact_width(200.0)
+            .resizable(false)
+            .frame(theme::rail_frame())
+            .show(ctx, |ui| {
+                ui.label(RichText::new("导航").small().color(theme::TEXT_DIM));
+                ui.add_space(4.0);
+                self.nav_item(ui, Tab::Home, "⌂", "首页");
+                self.nav_item(ui, Tab::Workflow, "◈", "工作流");
+                ui.add_space(8.0);
+                ui.label(RichText::new("生产阶段").small().color(theme::TEXT_DIM));
+                self.nav_item(ui, Tab::Script, "1", "剧本");
+                self.nav_item(ui, Tab::Parse, "2", "解析");
+                self.nav_item(ui, Tab::Assets, "3", "资产");
+                self.nav_item(ui, Tab::Storyboard, "4", "分镜");
+                self.nav_item(ui, Tab::Video, "5", "视频");
+                ui.add_space(8.0);
+                self.nav_item(ui, Tab::Settings, "⚙", "设置");
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("流水线").small().color(theme::TEXT_DIM));
+                if let Some(proj) = self.project.as_ref() {
+                    for stage in Stage::all() {
+                        let st = proj.state.get(*stage);
+                        let color = match st {
+                            StageStatus::Pending => theme::TEXT_DIM,
+                            StageStatus::InProgress => theme::INFO,
+                            StageStatus::Done => theme::SUCCESS,
+                            StageStatus::Approved => theme::WARNING,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(color, status_dot(st));
+                            ui.label(stage_zh(*stage));
+                            ui.label(RichText::new(status_zh(st)).small().color(theme::TEXT_DIM));
+                        });
+                    }
+                } else {
+                    ui.label(RichText::new("未打开项目").color(theme::TEXT_DIM));
+                }
+
+                ui.add_space(10.0);
+                if self.project.is_some() {
+                    if ui.button("打开项目目录").clicked() {
+                        if let Some(p) = self.project.as_ref() {
+                            open_path(&p.root);
+                        }
+                    }
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("日志").small().color(theme::TEXT_DIM));
+                        if ui.small_button("清空").clicked() {
+                            self.logs.clear();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in self.logs.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                                ui.label(
+                                    RichText::new(line)
+                                        .small()
+                                        .monospace()
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            }
+                        });
+                });
+            });
+    }
+
+    fn nav_item(&mut self, ui: &mut egui::Ui, tab: Tab, icon: &str, label: &str) {
+        let selected = self.tab == tab;
+        let fill = if selected {
+            theme::ACCENT_SOFT
+        } else {
+            Color32::TRANSPARENT
+        };
+        let stroke = if selected {
+            egui::Stroke::new(1.0_f32, theme::ACCENT)
+        } else {
+            egui::Stroke::NONE
+        };
+        let resp = egui::Frame::new()
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon).color(if selected {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT_MUTED
+                    }));
+                    ui.label(RichText::new(label).color(if selected {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_MUTED
+                    }));
+                });
+            })
+            .response
+            .interact(Sense::click());
+        if resp.hovered() && !selected {
+            ui.painter().rect_filled(
+                resp.rect,
+                8.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+            );
+        }
+        if resp.clicked() {
             self.tab = tab;
         }
     }
 
-    fn ui_workflow(&mut self, ui: &mut egui::Ui) {
-        if self.project.is_none() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.heading("工作流画布");
-                ui.label("请先打开或新建一个项目，然后在画布上编排流水线。");
-                ui.add_space(12.0);
-                if ui.button("前往项目总览").clicked() {
-                    self.tab = Tab::Overview;
-                }
-            });
-            return;
-        }
-        let action = self.workflow.show(
-            ui,
-            self.project.as_ref(),
-            self.busy,
-            self.busy_kind,
+    fn ui_home(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("首页").color(theme::TEXT));
+        ui.label(
+            RichText::new("剧本 → 解析 → 资产 → 分镜 → 视频 → 成片")
+                .color(theme::TEXT_MUTED),
         );
-        self.handle_wf_action(action);
-    }
+        ui.add_space(12.0);
 
-    fn ui_overview(&mut self, ui: &mut egui::Ui) {
-        ui.heading("项目总览");
-        ui.add_space(8.0);
-
-        if self.project.is_none() {
-            ui.label("创建新项目，或打开含 project.toml 的已有项目目录。");
-            ui.add_space(12.0);
-
-            if !self.app_settings.recent_projects.is_empty() {
-                ui.group(|ui| {
-                    ui.heading("最近项目");
+        ui.columns(2, |cols| {
+            theme::card_frame().show(&mut cols[0], |ui| {
+                ui.label(RichText::new("快速开始").strong().size(16.0));
+                ui.add_space(8.0);
+                if !self.app_settings.recent_projects.is_empty() {
+                    ui.label(RichText::new("最近项目").color(theme::TEXT_MUTED));
                     let recent = self.app_settings.recent_projects.clone();
-                    for p in recent {
+                    for p in recent.into_iter().take(6) {
                         ui.horizontal(|ui| {
-                            ui.monospace(p.display().to_string());
-                            if ui.button("打开").clicked() {
+                            let name = p
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("project");
+                            if ui.link(name).on_hover_text(p.display().to_string()).clicked() {
                                 self.open_project(&p);
                             }
                         });
                     }
-                });
-                ui.add_space(10.0);
-            }
-
-            ui.group(|ui| {
-                ui.heading("新建项目");
+                    ui.add_space(8.0);
+                }
                 ui.horizontal(|ui| {
-                    ui.label("父目录：");
-                    ui.label(self.create_parent.display().to_string());
-                    if ui.button("浏览…").clicked() {
+                    if ui.button("打开项目文件夹…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.open_project(&path);
+                        }
+                    }
+                    if ui.button("配置 API 密钥").clicked() {
+                        self.tab = Tab::Settings;
+                        self.settings_pane = SettingsPane::Keys;
+                    }
+                });
+            });
+
+            theme::card_frame().show(&mut cols[1], |ui| {
+                ui.label(RichText::new("新建项目").strong().size(16.0));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("目录");
+                    ui.label(
+                        RichText::new(self.create_parent.display().to_string())
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                    if ui.small_button("浏览").clicked() {
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             self.create_parent = p;
                         }
                     }
                 });
+                labeled_field(ui, "名称", &mut self.new_name, 200.0);
+                labeled_field(ui, "风格", &mut self.new_style, 280.0);
                 ui.horizontal(|ui| {
-                    ui.label("名称：");
-                    ui.text_edit_singleline(&mut self.new_name);
+                    ui.label("画幅");
+                    for a in ["16:9", "9:16", "1:1"] {
+                        ui.selectable_value(&mut self.new_aspect, a.to_string(), a);
+                    }
                 });
-                ui.horizontal(|ui| {
-                    ui.label("风格：");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_style).desired_width(480.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("画幅：");
-                    ui.selectable_value(&mut self.new_aspect, "16:9".into(), "16:9 横屏");
-                    ui.selectable_value(&mut self.new_aspect, "9:16".into(), "9:16 竖屏");
-                    ui.selectable_value(&mut self.new_aspect, "1:1".into(), "1:1");
-                });
-                if ui.button("创建项目").clicked() {
+                if ui
+                    .add(egui::Button::new("创建项目").fill(theme::ACCENT_SOFT))
+                    .clicked()
+                {
                     self.create_project();
+                }
+            });
+        });
+
+        if self.project.is_some() {
+            ui.add_space(14.0);
+            theme::card_frame().show(ui, |ui| {
+                ui.label(RichText::new("当前项目").strong().size(16.0));
+                if let Some(p) = self.project.as_ref() {
+                    ui.label(format!("{} · {}", p.config.name, p.root.display()));
+                    ui.label(format!("风格：{}", p.config.style));
+                    ui.label(format!(
+                        "产物：{} 资产 · {} 分镜 · {} 视频",
+                        self.asset_thumbs.len(),
+                        self.storyboard_thumbs.len(),
+                        self.video_files.len()
+                    ));
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let en = !self.busy;
+                    if ui.add_enabled(en, egui::Button::new("工作流画布")).clicked() {
+                        self.tab = Tab::Workflow;
+                    }
+                    if ui.add_enabled(en, egui::Button::new("导入剧本")).clicked() {
+                        self.import_script_dialog();
+                    }
+                    if ui.add_enabled(en, egui::Button::new("运行解析")).clicked() {
+                        self.submit(Job::Parse {
+                            dry_run: self.dry_run,
+                        });
+                    }
+                    if ui.add_enabled(en, egui::Button::new("生成资产")).clicked() {
+                        self.submit(Job::Assets {
+                            only: None,
+                            dry_run: self.dry_run,
+                        });
+                    }
+                    if ui.add_enabled(en, egui::Button::new("生成分镜")).clicked() {
+                        self.submit(Job::Storyboard {
+                            scene: None,
+                            shot: None,
+                            dry_run: self.dry_run,
+                        });
+                    }
+                    if ui.add_enabled(en, egui::Button::new("生成视频")).clicked() {
+                        self.submit(Job::Video {
+                            shot: None,
+                            concat: self.video_concat,
+                            dry_run: self.dry_run,
+                        });
+                    }
+                });
+            });
+        }
+    }
+
+    fn ui_workflow(&mut self, ui: &mut egui::Ui) {
+        if self.project.is_none() {
+            theme::card_frame().show(ui, |ui| {
+                ui.heading("工作流");
+                ui.label("请先在首页打开或新建项目。");
+                if ui.button("返回首页").clicked() {
+                    self.tab = Tab::Home;
                 }
             });
             return;
         }
-
-        let (name, style, aspect, root, counts) = {
-            let p = self.project.as_ref().unwrap();
-            let bd = p.load_breakdown().ok();
-            let counts = bd.map(|b| {
-                (
-                    b.characters.len(),
-                    b.locations.len(),
-                    b.scenes.len(),
-                    b.shots.len(),
-                )
-            });
-            (
-                p.config.name.clone(),
-                p.config.style.clone(),
-                p.config.aspect.clone(),
-                p.root.display().to_string(),
-                counts,
-            )
-        };
-
-        egui::Grid::new("proj_info")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("名称").weak());
-                ui.label(&name);
-                ui.end_row();
-                ui.label(RichText::new("路径").weak());
-                ui.monospace(&root);
-                ui.end_row();
-                ui.label(RichText::new("风格").weak());
-                ui.label(&style);
-                ui.end_row();
-                ui.label(RichText::new("画幅").weak());
-                ui.label(&aspect);
-                ui.end_row();
-            });
-
-        if let Some((c, l, s, sh)) = counts {
-            ui.label(format!(
-                "结构化：{c} 角色 · {l} 场景地 · {s} 场 · {sh} 镜头"
-            ));
-        }
-        ui.label(format!(
-            "产物：{} 张资产图 · {} 张分镜 · {} 个视频",
-            self.asset_thumbs.len(),
-            self.storyboard_thumbs.len(),
-            self.video_files.len()
-        ));
-
-        ui.add_space(14.0);
-        ui.heading("快捷操作");
-        ui.horizontal_wrapped(|ui| {
-            let en = !self.busy;
-            if ui
-                .add_enabled(en, egui::Button::new("导入剧本…"))
-                .clicked()
-            {
-                self.import_script_dialog();
-            }
-            if ui.add_enabled(en, egui::Button::new("运行解析")).clicked() {
-                self.submit(Job::Parse {
-                    dry_run: self.dry_run,
-                });
-            }
-            if ui.add_enabled(en, egui::Button::new("生成资产")).clicked() {
-                self.submit(Job::Assets {
-                    only: None,
-                    dry_run: self.dry_run,
-                });
-            }
-            if ui.add_enabled(en, egui::Button::new("生成分镜")).clicked() {
-                self.submit(Job::Storyboard {
-                    scene: None,
-                    shot: None,
-                    dry_run: self.dry_run,
-                });
-            }
-            if ui.add_enabled(en, egui::Button::new("生成视频")).clicked() {
-                self.submit(Job::Video {
-                    shot: None,
-                    concat: self.video_concat,
-                    dry_run: self.dry_run,
-                });
-            }
-            if ui
-                .add_enabled(en, egui::Button::new("打开工作流画布"))
-                .clicked()
-            {
-                self.tab = Tab::Workflow;
-            }
-        });
-
-        ui.add_space(10.0);
-        ui.heading("阶段审核");
-        ui.horizontal_wrapped(|ui| {
-            for stage in Stage::all() {
-                if ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Button::new(format!("通过 · {}", stage_zh(*stage))),
-                    )
-                    .clicked()
-                {
-                    self.submit(Job::Approve { stage: *stage });
-                }
-            }
-        });
+        let action = self
+            .workflow
+            .show(ui, self.project.as_ref(), self.busy, self.busy_kind);
+        self.handle_wf_action(action);
     }
 
     fn ui_script(&mut self, ui: &mut egui::Ui) {
+        self.page_header(ui, "剧本", "导入、编辑并保存剧本文本");
         ui.horizontal(|ui| {
-            ui.heading("剧本");
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("导入…"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("导入…"))
                 .clicked()
             {
                 self.import_script_dialog();
@@ -829,70 +916,37 @@ impl AdramaApp {
             if ui
                 .add_enabled(
                     !self.busy && self.project.is_some(),
-                    egui::Button::new(if self.script_dirty {
-                        "保存 *"
-                    } else {
-                        "保存"
-                    }),
+                    egui::Button::new(if self.script_dirty { "保存 *" } else { "保存" }),
                 )
                 .clicked()
             {
                 self.save_script();
             }
             if let Some(p) = &self.script_path {
-                ui.label(RichText::new(p.display().to_string()).small().weak());
+                ui.label(RichText::new(p.display().to_string()).small().color(theme::TEXT_DIM));
             }
         });
-        ui.label(
-            RichText::new("支持 .md / .txt / .fountain · 可直接编辑后保存到项目 script/ 目录")
-                .weak(),
-        );
-        ui.separator();
-        egui::ScrollArea::both().show(ui, |ui| {
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut self.script_text)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(28)
-                    .font(egui::TextStyle::Monospace),
-            );
-            if response.changed() {
-                self.script_dirty = true;
-            }
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::multiline(&mut self.script_text)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(30)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if r.changed() {
+                    self.script_dirty = true;
+                }
+            });
         });
-    }
-
-    fn save_script(&mut self) {
-        let Some(proj) = self.project.as_ref() else {
-            return;
-        };
-        let path = if let Some(p) = self.script_path.clone() {
-            p
-        } else {
-            let dir = proj.script_dir();
-            if let Err(e) = fs::create_dir_all(&dir) {
-                self.error_msg = format!("创建 script 目录失败: {e}");
-                return;
-            }
-            dir.join("script.md")
-        };
-        match fs::write(&path, &self.script_text) {
-            Ok(()) => {
-                self.script_path = Some(path.clone());
-                self.script_dirty = false;
-                self.status_msg = format!("剧本已保存 → {}", path.display());
-            }
-            Err(e) => self.error_msg = format!("保存失败: {e}"),
-        }
     }
 
     fn ui_parse(&mut self, ui: &mut egui::Ui) {
+        self.page_header(ui, "阶段 · 解析", "LLM 将剧本转为角色 / 场景 / 镜头结构");
         ui.horizontal(|ui| {
-            ui.heading("阶段 1 · 解析");
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("运行解析"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("运行解析"))
                 .clicked()
             {
                 self.submit(Job::Parse {
@@ -900,10 +954,7 @@ impl AdramaApp {
                 });
             }
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("审核通过"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("审核通过"))
                 .clicked()
             {
                 self.submit(Job::Approve {
@@ -911,31 +962,33 @@ impl AdramaApp {
                 });
             }
         });
-        ui.label("使用对话模型将剧本解析为角色 / 场景 / 镜头结构（breakdown.json）。");
-        ui.separator();
-
+        ui.add_space(8.0);
         if let Some(proj) = self.project.as_ref() {
             if let Ok(bd) = proj.load_breakdown() {
-                self.ui_breakdown_summary(ui, &bd);
-                ui.separator();
+                theme::section_frame().show(ui, |ui| {
+                    self.ui_breakdown_summary(ui, &bd);
+                });
+                ui.add_space(8.0);
             }
         }
-
-        egui::ScrollArea::both().show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut self.breakdown_text)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .interactive(false),
-            );
+        theme::card_frame().show(ui, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.breakdown_text)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(24)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            });
         });
     }
 
     fn ui_breakdown_summary(&self, ui: &mut egui::Ui, bd: &Breakdown) {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.label(RichText::new(&bd.title).strong());
             if !bd.summary.is_empty() {
-                ui.label(RichText::new(&bd.summary).italics());
+                ui.label(RichText::new(&bd.summary).italics().color(theme::TEXT_MUTED));
             }
         });
         ui.collapsing(format!("角色（{}）", bd.characters.len()), |ui| {
@@ -957,13 +1010,10 @@ impl AdramaApp {
     }
 
     fn ui_assets(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.page_header(ui, "阶段 · 资产", "角色定妆照、服装、道具、场景参考图");
         ui.horizontal(|ui| {
-            ui.heading("阶段 2 · 资产");
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("全部生成"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("全部生成"))
                 .clicked()
             {
                 self.submit(Job::Assets {
@@ -972,24 +1022,19 @@ impl AdramaApp {
                 });
             }
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("审核通过"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("审核通过"))
                 .clicked()
             {
                 self.submit(Job::Approve {
                     stage: Stage::Assets,
                 });
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label("仅生成名称/ID：");
-            ui.add(egui::TextEdit::singleline(&mut self.only_asset).desired_width(160.0));
+            ui.label("仅生成");
+            ui.add(egui::TextEdit::singleline(&mut self.only_asset).desired_width(120.0));
             if ui
                 .add_enabled(
                     !self.busy && self.project.is_some() && !self.only_asset.trim().is_empty(),
-                    egui::Button::new("生成指定项"),
+                    egui::Button::new("生成"),
                 )
                 .clicked()
             {
@@ -1000,18 +1045,15 @@ impl AdramaApp {
             }
         });
         self.ui_redo_row(ui, Stage::Assets);
-        ui.separator();
+        ui.add_space(8.0);
         self.ui_image_grid(ui, ctx, &self.asset_thumbs.clone());
     }
 
     fn ui_storyboard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.page_header(ui, "阶段 · 分镜", "按镜头生成参考图，保持角色一致性");
         ui.horizontal(|ui| {
-            ui.heading("阶段 3 · 分镜");
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("全部生成"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("全部生成"))
                 .clicked()
             {
                 self.submit(Job::Storyboard {
@@ -1021,51 +1063,38 @@ impl AdramaApp {
                 });
             }
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("审核通过"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("审核通过"))
                 .clicked()
             {
                 self.submit(Job::Approve {
                     stage: Stage::Storyboard,
                 });
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label("场次 #：");
-            ui.add(egui::TextEdit::singleline(&mut self.scene_filter).desired_width(60.0));
-            ui.label("镜头 ID：");
-            ui.add(egui::TextEdit::singleline(&mut self.shot_filter).desired_width(120.0));
+            ui.label("场次");
+            ui.add(egui::TextEdit::singleline(&mut self.scene_filter).desired_width(48.0));
+            ui.label("镜头");
+            ui.add(egui::TextEdit::singleline(&mut self.shot_filter).desired_width(100.0));
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("按条件生成"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("筛选生成"))
                 .clicked()
             {
-                let scene = self.scene_filter.trim().parse().ok();
-                let shot = nonempty(&self.shot_filter);
                 self.submit(Job::Storyboard {
-                    scene,
-                    shot,
+                    scene: self.scene_filter.trim().parse().ok(),
+                    shot: nonempty(&self.shot_filter),
                     dry_run: self.dry_run,
                 });
             }
         });
         self.ui_redo_row(ui, Stage::Storyboard);
-        ui.separator();
+        ui.add_space(8.0);
         self.ui_image_grid(ui, ctx, &self.storyboard_thumbs.clone());
     }
 
     fn ui_video(&mut self, ui: &mut egui::Ui) {
+        self.page_header(ui, "阶段 · 视频", "分镜图生视频，可选 ffmpeg 拼接成片");
         ui.horizontal(|ui| {
-            ui.heading("阶段 4 · 视频");
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("全部生成"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("全部生成"))
                 .clicked()
             {
                 self.submit(Job::Video {
@@ -1075,26 +1104,18 @@ impl AdramaApp {
                 });
             }
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("审核通过"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("审核通过"))
                 .clicked()
             {
                 self.submit(Job::Approve {
                     stage: Stage::Video,
                 });
             }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.video_concat, "生成后用 ffmpeg 拼接成片");
-            ui.label("镜头 ID：");
-            ui.add(egui::TextEdit::singleline(&mut self.shot_filter).desired_width(120.0));
+            ui.checkbox(&mut self.video_concat, "生成后拼接");
+            ui.label("镜头");
+            ui.add(egui::TextEdit::singleline(&mut self.shot_filter).desired_width(100.0));
             if ui
-                .add_enabled(
-                    !self.busy && self.project.is_some(),
-                    egui::Button::new("生成指定镜头"),
-                )
+                .add_enabled(!self.busy && self.project.is_some(), egui::Button::new("生成镜头"))
                 .clicked()
             {
                 self.submit(Job::Video {
@@ -1105,415 +1126,295 @@ impl AdramaApp {
             }
         });
         self.ui_redo_row(ui, Stage::Video);
-        ui.separator();
+        ui.add_space(8.0);
+
         if let Some(proj) = self.project.as_ref() {
             let final_mp4 = proj.video_dir().join("final.mp4");
             if final_mp4.exists() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(100, 200, 120), "成片 final.mp4 已生成");
-                    if ui.button("播放成片").clicked() {
-                        open_path(&final_mp4);
-                    }
+                theme::section_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(theme::SUCCESS, "成片 final.mp4 已就绪");
+                        if ui.button("播放").clicked() {
+                            open_path(&final_mp4);
+                        }
+                    });
                 });
+                ui.add_space(8.0);
             }
         }
-        ui.label("视频文件（用系统播放器打开）：");
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.video_files.is_empty() {
-                ui.label(RichText::new("（暂无 mp4）").weak());
-            }
-            for path in self.video_files.clone() {
-                ui.horizontal(|ui| {
-                    ui.monospace(
-                        path.file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?"),
-                    );
-                    if ui.button("打开").clicked() {
-                        open_path(&path);
-                    }
-                    if ui.button("所在文件夹").clicked() {
-                        if let Some(parent) = path.parent() {
-                            open_path(parent);
+
+        theme::card_frame().show(ui, |ui| {
+            ui.label(RichText::new("视频片段").strong());
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.video_files.is_empty() {
+                    ui.label(RichText::new("（暂无视频）").color(theme::TEXT_DIM));
+                }
+                for path in self.video_files.clone() {
+                    ui.horizontal(|ui| {
+                        ui.monospace(
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?"),
+                        );
+                        if ui.small_button("打开").clicked() {
+                            open_path(&path);
                         }
-                    }
-                });
-            }
+                        if ui.small_button("文件夹").clicked() {
+                            if let Some(parent) = path.parent() {
+                                open_path(parent);
+                            }
+                        }
+                    });
+                }
+            });
         });
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("设置");
+        self.page_header(
+            ui,
+            "设置",
+            "各厂商支持「官方 / 自定义」独立密钥与端点",
+        );
+
+        ui.horizontal(|ui| {
+            for (pane, label) in [
+                (SettingsPane::Keys, "API 密钥"),
+                (SettingsPane::Routing, "能力路由"),
+                (SettingsPane::Project, "项目配置"),
+            ] {
+                if ui
+                    .selectable_label(self.settings_pane == pane, label)
+                    .clicked()
+                {
+                    self.settings_pane = pane;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| match self.settings_pane {
+            SettingsPane::Keys => self.ui_settings_keys(ui),
+            SettingsPane::Routing => self.ui_settings_routing(ui),
+            SettingsPane::Project => self.ui_settings_project(ui),
+        });
+    }
+
+    fn ui_settings_keys(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(format!(
-                "全局密钥文件：{}",
+                "密钥文件：{}",
                 AppSettings::config_path().display()
             ))
             .small()
-            .weak(),
+            .color(theme::TEXT_DIM),
         );
         ui.add_space(8.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // ---- API Keys ----
-            ui.group(|ui| {
-                ui.label(RichText::new("API 密钥（本机持久化）").strong().size(16.0));
-                ui.label(
-                    RichText::new("密钥不会写入项目目录；仅保存在用户配置目录。")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(6.0);
+        let mut dirty = self.settings_dirty;
+        let mut test_openai = false;
+        let mut test_google = false;
+        let mut test_xai = false;
 
-                key_row(
-                    ui,
-                    "OpenAI / Image2 Key",
-                    "OPENAI_API_KEY",
-                    &mut self.app_settings.openai_api_key,
-                    &mut self.settings_dirty,
-                );
-                key_row(
-                    ui,
-                    "Google / Gemini / Veo（Omni）Key",
-                    "GEMINI_API_KEY",
-                    &mut self.app_settings.gemini_api_key,
-                    &mut self.settings_dirty,
-                );
-                key_row(
-                    ui,
-                    "xAI / Grok Key",
-                    "XAI_API_KEY",
-                    &mut self.app_settings.xai_api_key,
-                    &mut self.settings_dirty,
-                );
-                key_row(
-                    ui,
-                    "自定义端点 Key",
-                    "ADRAMA_CUSTOM_API_KEY",
-                    &mut self.app_settings.custom_api_key,
-                    &mut self.settings_dirty,
-                );
+        theme::card_frame().show(ui, |ui| {
+            vendor_key_card_ui(
+                ui,
+                "OpenAI / Image2",
+                "对话解析 · 图像生成（gpt-image）",
+                theme::STAGE_ASSETS,
+                &mut self.edit_config.openai_mode,
+                &mut self.app_settings.openai_official_key,
+                &mut self.app_settings.openai_custom_key,
+                OPENAI_OFFICIAL_BASE,
+                &mut self.edit_config.openai_custom_base_url,
+                !self.busy,
+                &mut dirty,
+                &mut test_openai,
+            );
+        });
+        ui.add_space(10.0);
+        theme::card_frame().show(ui, |ui| {
+            vendor_key_card_ui(
+                ui,
+                "Google / Gemini / Veo",
+                "视频生成（Veo / Omni）· 可选对话/图像",
+                theme::STAGE_VIDEO,
+                &mut self.edit_config.google_mode,
+                &mut self.app_settings.google_official_key,
+                &mut self.app_settings.google_custom_key,
+                GOOGLE_OFFICIAL_BASE,
+                &mut self.edit_config.google_custom_base_url,
+                !self.busy,
+                &mut dirty,
+                &mut test_google,
+            );
+        });
+        ui.add_space(10.0);
+        theme::card_frame().show(ui, |ui| {
+            vendor_key_card_ui(
+                ui,
+                "xAI / Grok",
+                "Grok 对话 · 图像 · 视频",
+                theme::STAGE_STORY,
+                &mut self.edit_config.xai_mode,
+                &mut self.app_settings.xai_official_key,
+                &mut self.app_settings.xai_custom_key,
+                XAI_OFFICIAL_BASE,
+                &mut self.edit_config.xai_custom_base_url,
+                !self.busy,
+                &mut dirty,
+                &mut test_xai,
+            );
+        });
+        self.settings_dirty = dirty;
 
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存密钥").clicked() {
-                        self.save_app_settings();
-                    }
-                    if ui.button("应用到当前进程").clicked() {
-                        self.app_settings.apply_to_env();
-                        self.status_msg = "密钥已应用到当前会话".into();
-                    }
-                });
-                ui.add_space(6.0);
-                ui.label(RichText::new("连接测试").strong());
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("测试 OpenAI / Image2"))
-                        .clicked()
-                    {
-                        self.app_settings.apply_to_env();
-                        self.submit(Job::TestEndpoint {
-                            kind: "OpenAI / Image2".into(),
-                            base_url: self.edit_config.openai_base_url.clone(),
-                            api_key: self.app_settings.openai_api_key.clone(),
-                            model: self.edit_config.openai_chat_model.clone(),
-                        });
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("测试 Google / Veo"))
-                        .clicked()
-                    {
-                        self.app_settings.apply_to_env();
-                        self.submit(Job::TestEndpoint {
-                            kind: "Google / Veo".into(),
-                            base_url: self.edit_config.google_base_url.clone(),
-                            api_key: self.app_settings.gemini_api_key.clone(),
-                            model: self.edit_config.google_video_model.clone(),
-                        });
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("测试 Grok / xAI"))
-                        .clicked()
-                    {
-                        self.app_settings.apply_to_env();
-                        self.submit(Job::TestEndpoint {
-                            kind: "xAI / Grok".into(),
-                            base_url: self.edit_config.xai_base_url.clone(),
-                            api_key: self.app_settings.xai_api_key.clone(),
-                            model: self.edit_config.xai_chat_model.clone(),
-                        });
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("测试自定义端点"))
-                        .clicked()
-                    {
-                        self.app_settings.apply_to_env();
-                        self.submit(Job::TestEndpoint {
-                            kind: "自定义".into(),
-                            base_url: self.edit_config.custom_base_url.clone(),
-                            api_key: self.app_settings.custom_api_key.clone(),
-                            model: self.edit_config.custom_chat_model.clone(),
-                        });
-                    }
-                });
-            });
+        if test_openai {
+            self.run_connection_test(ProviderKind::OpenAi);
+        }
+        if test_google {
+            self.run_connection_test(ProviderKind::Google);
+        }
+        if test_xai {
+            self.run_connection_test(ProviderKind::Xai);
+        }
 
-            ui.add_space(12.0);
-
-            // ---- Project endpoints ----
-            if self.project.is_some() {
-                ui.group(|ui| {
-                    ui.label(
-                        RichText::new("项目模型与端点（project.toml）")
-                            .strong()
-                            .size(16.0),
-                    );
-                    ui.label(
-                        RichText::new(
-                            "可分别配置 Image2、Omni/Veo、Grok 的 Base URL 与模型名；\
-                             支持 OpenAI 兼容代理。",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("项目名：");
-                        if ui
-                            .text_edit_singleline(&mut self.edit_config.name)
-                            .changed()
-                        {
-                            self.settings_dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("风格前缀：");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.edit_config.style)
-                                    .desired_width(420.0),
-                            )
-                            .changed()
-                        {
-                            self.settings_dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("画幅：");
-                        for a in ["16:9", "9:16", "1:1"] {
-                            if ui
-                                .selectable_value(
-                                    &mut self.edit_config.aspect,
-                                    a.to_string(),
-                                    a,
-                                )
-                                .changed()
-                            {
-                                self.settings_dirty = true;
-                            }
-                        }
-                    });
-
-                    ui.separator();
-                    ui.label(RichText::new("能力路由（用哪家服务）").strong());
-                    provider_row(
-                        ui,
-                        "对话 / 剧本解析",
-                        &mut self.edit_config.chat_provider,
-                        &mut self.settings_dirty,
-                    );
-                    provider_row(
-                        ui,
-                        "图像（资产 / 分镜）",
-                        &mut self.edit_config.image_provider,
-                        &mut self.settings_dirty,
-                    );
-                    provider_row(
-                        ui,
-                        "视频（图生视频）",
-                        &mut self.edit_config.video_provider,
-                        &mut self.settings_dirty,
-                    );
-
-                    ui.separator();
-                    ui.collapsing(
-                        RichText::new("① OpenAI / Image2（图片与对话）").strong(),
-                        |ui| {
-                            field(
-                                ui,
-                                "Base URL",
-                                &mut self.edit_config.openai_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "对话模型",
-                                &mut self.edit_config.openai_chat_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "图像模型（Image2）",
-                                &mut self.edit_config.openai_image_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            ui.label(
-                                RichText::new(
-                                    "示例：https://api.openai.com/v1  或兼容代理地址",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        },
-                    );
-
-                    ui.collapsing(
-                        RichText::new("② Google / Gemini / Veo（Omni 视频）").strong(),
-                        |ui| {
-                            field(
-                                ui,
-                                "Base URL",
-                                &mut self.edit_config.google_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "视频模型",
-                                &mut self.edit_config.google_video_model,
-                                320.0,
-                                &mut self.settings_dirty,
-                            );
-                            ui.label(
-                                RichText::new(
-                                    "示例：https://generativelanguage.googleapis.com/v1beta\n\
-                                     模型：veo-3.1-generate-preview（以官方文档为准）",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        },
-                    );
-
-                    ui.collapsing(
-                        RichText::new("③ xAI / Grok（图片 · 对话 · 视频）").strong(),
-                        |ui| {
-                            field(
-                                ui,
-                                "Base URL（OpenAI 兼容）",
-                                &mut self.edit_config.xai_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "对话模型",
-                                &mut self.edit_config.xai_chat_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "图像模型",
-                                &mut self.edit_config.xai_image_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "视频模型",
-                                &mut self.edit_config.xai_video_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "视频 Base URL（可空=同上）",
-                                &mut self.edit_config.xai_video_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                            ui.label(
-                                RichText::new(
-                                    "默认：https://api.x.ai/v1  ·  需填写 XAI_API_KEY / Grok Key",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        },
-                    );
-
-                    ui.collapsing(
-                        RichText::new("④ 自定义 OpenAI 兼容端点").strong(),
-                        |ui| {
-                            field(
-                                ui,
-                                "Base URL",
-                                &mut self.edit_config.custom_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "对话模型",
-                                &mut self.edit_config.custom_chat_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "图像模型",
-                                &mut self.edit_config.custom_image_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "视频模型",
-                                &mut self.edit_config.custom_video_model,
-                                280.0,
-                                &mut self.settings_dirty,
-                            );
-                            field(
-                                ui,
-                                "视频 Base URL（可空）",
-                                &mut self.edit_config.custom_video_base_url,
-                                460.0,
-                                &mut self.settings_dirty,
-                            );
-                        },
-                    );
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let label = if self.settings_dirty {
-                            "保存 project.toml *"
-                        } else {
-                            "保存 project.toml"
-                        };
-                        if ui.button(label).clicked() {
-                            self.save_config();
-                        }
-                        if ui.button("从磁盘重新加载").clicked() {
-                            self.reload_project();
-                        }
-                    });
-                });
-            } else {
-                ui.group(|ui| {
-                    ui.label("打开项目后，可在此编辑各厂商 Base URL 与模型 ID。");
-                });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new("保存全部密钥").fill(theme::ACCENT_SOFT))
+                .clicked()
+            {
+                self.save_app_settings();
+                if self.project.is_some() {
+                    self.save_config();
+                }
+            }
+            if ui.button("仅应用密钥到会话").clicked() {
+                self.app_settings.apply_to_env();
+                self.status_msg = "密钥已应用到当前会话".into();
             }
         });
     }
 
+    fn run_connection_test(&mut self, family: ProviderKind) {
+        self.app_settings.apply_to_env();
+        let (kind, base_url, api_key, mode) = self.resolved_key_url_for_test(family);
+        let model = match family {
+            ProviderKind::OpenAi => self.edit_config.openai_chat_model.clone(),
+            ProviderKind::Google => self.edit_config.google_video_model.clone(),
+            ProviderKind::Xai => self.edit_config.xai_chat_model.clone(),
+        };
+        self.submit(Job::TestEndpoint {
+            kind: format!("{kind} · {}", mode.label_zh()),
+            base_url,
+            api_key,
+            model,
+        });
+    }
+
+    fn ui_settings_routing(&mut self, ui: &mut egui::Ui) {
+        if self.project.is_none() {
+            ui.label("打开项目后可配置能力路由与模型。");
+            return;
+        }
+        theme::card_frame().show(ui, |ui| {
+            ui.label(RichText::new("能力使用哪家服务").strong().size(15.0));
+            ui.label(
+                RichText::new("每家服务在「API 密钥」页各自选择官方或自定义。")
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(10.0);
+            provider_pick(ui, "对话 / 剧本解析", &mut self.edit_config.chat_provider, &mut self.settings_dirty);
+            provider_pick(ui, "图像（资产 / 分镜）", &mut self.edit_config.image_provider, &mut self.settings_dirty);
+            provider_pick(ui, "视频（图生视频）", &mut self.edit_config.video_provider, &mut self.settings_dirty);
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(RichText::new("模型 ID").strong());
+            ui.add_space(6.0);
+
+            ui.collapsing("OpenAI / Image2 模型", |ui| {
+                field(ui, "对话模型", &mut self.edit_config.openai_chat_model, 260.0, &mut self.settings_dirty);
+                field(ui, "图像模型", &mut self.edit_config.openai_image_model, 260.0, &mut self.settings_dirty);
+            });
+            ui.collapsing("Google 模型", |ui| {
+                field(ui, "对话模型", &mut self.edit_config.google_chat_model, 260.0, &mut self.settings_dirty);
+                field(ui, "图像模型", &mut self.edit_config.google_image_model, 260.0, &mut self.settings_dirty);
+                field(ui, "视频模型", &mut self.edit_config.google_video_model, 280.0, &mut self.settings_dirty);
+            });
+            ui.collapsing("xAI / Grok 模型", |ui| {
+                field(ui, "对话模型", &mut self.edit_config.xai_chat_model, 260.0, &mut self.settings_dirty);
+                field(ui, "图像模型", &mut self.edit_config.xai_image_model, 260.0, &mut self.settings_dirty);
+                field(ui, "视频模型", &mut self.edit_config.xai_video_model, 260.0, &mut self.settings_dirty);
+                field(
+                    ui,
+                    "视频自定义 URL（可空）",
+                    &mut self.edit_config.xai_video_base_url,
+                    320.0,
+                    &mut self.settings_dirty,
+                );
+            });
+
+            ui.add_space(10.0);
+            if ui
+                .add(egui::Button::new("保存路由与模型").fill(theme::ACCENT_SOFT))
+                .clicked()
+            {
+                self.save_config();
+            }
+        });
+    }
+
+    fn ui_settings_project(&mut self, ui: &mut egui::Ui) {
+        if self.project.is_none() {
+            ui.label("打开项目后可编辑 project.toml。");
+            return;
+        }
+        theme::card_frame().show(ui, |ui| {
+            ui.label(RichText::new("项目基本信息").strong().size(15.0));
+            field(ui, "名称", &mut self.edit_config.name, 240.0, &mut self.settings_dirty);
+            field(ui, "风格前缀", &mut self.edit_config.style, 400.0, &mut self.settings_dirty);
+            ui.horizontal(|ui| {
+                ui.label("画幅");
+                for a in ["16:9", "9:16", "1:1"] {
+                    if ui
+                        .selectable_value(&mut self.edit_config.aspect, a.to_string(), a)
+                        .changed()
+                    {
+                        self.settings_dirty = true;
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            if ui
+                .add(egui::Button::new(if self.settings_dirty {
+                    "保存 project.toml *"
+                } else {
+                    "保存 project.toml"
+                })
+                .fill(theme::ACCENT_SOFT))
+                .clicked()
+            {
+                self.save_config();
+            }
+            if ui.button("从磁盘重新加载").clicked() {
+                self.reload_project();
+            }
+        });
+    }
+
+    fn page_header(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(title).color(theme::TEXT));
+        });
+        ui.label(RichText::new(subtitle).color(theme::TEXT_MUTED));
+        ui.add_space(8.0);
+    }
+
     fn ui_redo_row(&mut self, ui: &mut egui::Ui, stage: Stage) {
         ui.horizontal(|ui| {
-            ui.label("重生成 ID：");
+            ui.label("重生成 ID");
             ui.add(egui::TextEdit::singleline(&mut self.redo_id).desired_width(140.0));
             if ui
                 .add_enabled(
@@ -1533,95 +1434,203 @@ impl AdramaApp {
 
     fn ui_image_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, paths: &[PathBuf]) {
         if paths.is_empty() {
-            ui.label(RichText::new("（暂无图片）").weak());
+            theme::card_frame().show(ui, |ui| {
+                ui.label(RichText::new("（暂无图片）").color(theme::TEXT_DIM));
+            });
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let thumb = 168.0;
+            let thumb = 156.0;
             ui.horizontal_wrapped(|ui| {
                 for path in paths {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(thumb + 16.0, thumb + 52.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            if let Some(tex) = self.texture_for(ctx, path) {
-                                let size = tex.size_vec2();
-                                let scale = (thumb / size.x).min(thumb / size.y).min(1.0);
-                                let img = egui::Image::new((tex.id(), size * scale))
-                                    .maintain_aspect_ratio(true);
-                                if ui
-                                    .add(img)
-                                    .on_hover_text(format!(
-                                        "{}\n单击预览 · 双击用系统程序打开",
-                                        path.display()
-                                    ))
-                                    .clicked()
-                                {
-                                    self.preview_image = Some(path.clone());
-                                }
-                                if ui.input(|i| {
-                                    i.pointer
-                                        .button_double_clicked(egui::PointerButton::Primary)
-                                }) {
-                                    // double-click handled via secondary button below
-                                }
-                            } else {
-                                ui.allocate_exact_size(Vec2::splat(thumb), egui::Sense::hover());
-                                ui.label("?");
+                    theme::section_frame().show(ui, |ui| {
+                        ui.set_width(thumb + 8.0);
+                        if let Some(tex) = self.texture_for(ctx, path) {
+                            let size = tex.size_vec2();
+                            let scale = (thumb / size.x).min(thumb / size.y).min(1.0);
+                            let img = egui::Image::new((tex.id(), size * scale))
+                                .maintain_aspect_ratio(true)
+                                .corner_radius(6.0);
+                            if ui
+                                .add(img)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                self.preview_image = Some(path.clone());
                             }
-                            let name = path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("?");
-                            ui.label(RichText::new(name).small());
-                            ui.horizontal(|ui| {
-                                if ui.small_button("预览").clicked() {
-                                    self.preview_image = Some(path.clone());
-                                }
-                                if ui.small_button("打开").clicked() {
-                                    open_path(path);
-                                }
-                            });
-                            if let Some(st) = sibling_item_status(path) {
-                                ui.label(
-                                    RichText::new(item_status_zh(st)).small().weak(),
-                                );
+                        }
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?");
+                        ui.label(RichText::new(name).small().color(theme::TEXT_MUTED));
+                        ui.horizontal(|ui| {
+                            if ui.small_button("预览").clicked() {
+                                self.preview_image = Some(path.clone());
                             }
-                        },
-                    );
+                            if ui.small_button("打开").clicked() {
+                                open_path(path);
+                            }
+                        });
+                        if let Some(st) = sibling_item_status(path) {
+                            ui.label(
+                                RichText::new(item_status_zh(st))
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                            );
+                        }
+                    });
                 }
             });
         });
     }
+
+    fn ui_preview_window(&mut self, ctx: &egui::Context) {
+        if self.preview_image.is_none() {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("图片预览")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([760.0, 560.0])
+            .frame(theme::card_frame())
+            .show(ctx, |ui| {
+                if let Some(path) = self.preview_image.clone() {
+                    ui.label(RichText::new(path.display().to_string()).small());
+                    ui.separator();
+                    if let Some(tex) = self.texture_for(ctx, &path) {
+                        let avail = ui.available_size() - Vec2::new(0.0, 40.0);
+                        let size = tex.size_vec2();
+                        let scale = (avail.x / size.x).min(avail.y / size.y).min(1.0).max(0.05);
+                        ui.image((tex.id(), size * scale));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("系统打开").clicked() {
+                            open_path(&path);
+                        }
+                        if ui.button("关闭").clicked() {
+                            self.preview_image = None;
+                        }
+                    });
+                }
+            });
+        if !open {
+            self.preview_image = None;
+        }
+    }
 }
 
-fn key_row(
+#[allow(clippy::too_many_arguments)]
+fn vendor_key_card_ui(
     ui: &mut egui::Ui,
-    label: &str,
-    env_hint: &str,
-    value: &mut String,
+    title: &str,
+    subtitle: &str,
+    accent: Color32,
+    mode: &mut EndpointMode,
+    official_key: &mut String,
+    custom_key: &mut String,
+    official_url: &str,
+    custom_url: &mut String,
+    can_test: bool,
     dirty: &mut bool,
+    test_clicked: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.set_min_width(220.0);
-        ui.label(label);
-        if ui
-            .add(
-                egui::TextEdit::singleline(value)
-                    .password(true)
-                    .desired_width(360.0)
-                    .hint_text(env_hint),
-            )
-            .changed()
-        {
-            *dirty = true;
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 5.0, accent);
+        ui.label(RichText::new(title).strong().size(15.0));
+    });
+    ui.label(RichText::new(subtitle).small().color(theme::TEXT_MUTED));
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        ui.label("端点模式");
+        for m in [EndpointMode::Official, EndpointMode::Custom] {
+            if ui.selectable_value(mode, m, m.label_zh()).changed() {
+                *dirty = true;
+            }
         }
+    });
+
+    ui.add_space(6.0);
+    match *mode {
+        EndpointMode::Official => {
+            ui.label(
+                RichText::new(format!("官方地址：{official_url}"))
+                    .small()
+                    .monospace()
+                    .color(theme::TEXT_DIM),
+            );
+            ui.horizontal(|ui| {
+                ui.set_min_width(100.0);
+                ui.label("官方密钥");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(official_key)
+                            .password(true)
+                            .desired_width(360.0)
+                            .hint_text("sk-... / AIza..."),
+                    )
+                    .changed()
+                {
+                    *dirty = true;
+                }
+            });
+        }
+        EndpointMode::Custom => {
+            ui.horizontal(|ui| {
+                ui.set_min_width(100.0);
+                ui.label("自定义 URL");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(custom_url)
+                            .desired_width(360.0)
+                            .hint_text("https://proxy.example.com/v1"),
+                    )
+                    .changed()
+                {
+                    *dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.set_min_width(100.0);
+                ui.label("自定义密钥");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(custom_key)
+                            .password(true)
+                            .desired_width(360.0),
+                    )
+                    .changed()
+                {
+                    *dirty = true;
+                }
+            });
+        }
+    }
+
+    ui.add_space(6.0);
+    if ui
+        .add_enabled(can_test, egui::Button::new("测试当前模式连接"))
+        .clicked()
+    {
+        *test_clicked = true;
+    }
+}
+
+fn labeled_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
+    ui.horizontal(|ui| {
+        ui.set_min_width(48.0);
+        ui.label(label);
+        ui.add(egui::TextEdit::singleline(value).desired_width(width));
     });
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32, dirty: &mut bool) {
     ui.horizontal(|ui| {
-        ui.set_min_width(160.0);
+        ui.set_min_width(120.0);
         ui.label(label);
         if ui
             .add(egui::TextEdit::singleline(value).desired_width(width))
@@ -1632,25 +1641,21 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32, dirty: 
     });
 }
 
-fn provider_row(
+fn provider_pick(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut ProviderKind,
     dirty: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.set_min_width(160.0);
+        ui.set_min_width(140.0);
         ui.label(label);
         for p in [
             ProviderKind::OpenAi,
             ProviderKind::Google,
             ProviderKind::Xai,
-            ProviderKind::Custom,
         ] {
-            if ui
-                .selectable_value(value, p, p.label_zh())
-                .changed()
-            {
+            if ui.selectable_value(value, p, p.label_zh()).changed() {
                 *dirty = true;
             }
         }
@@ -1694,6 +1699,15 @@ fn status_zh(st: StageStatus) -> &'static str {
         StageStatus::InProgress => "进行中",
         StageStatus::Done => "已完成",
         StageStatus::Approved => "已审核",
+    }
+}
+
+fn status_dot(st: StageStatus) -> &'static str {
+    match st {
+        StageStatus::Pending => "○",
+        StageStatus::InProgress => "◐",
+        StageStatus::Done => "●",
+        StageStatus::Approved => "★",
     }
 }
 

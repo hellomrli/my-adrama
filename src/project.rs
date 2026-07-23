@@ -75,7 +75,7 @@ pub enum StageStatus {
     Approved,
 }
 
-/// Which backend to use for a capability.
+/// Which backend family to use for a capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -83,7 +83,6 @@ pub enum ProviderKind {
     OpenAi,
     Google,
     Xai,
-    Custom,
 }
 
 impl ProviderKind {
@@ -92,16 +91,14 @@ impl ProviderKind {
             ProviderKind::OpenAi => "openai",
             ProviderKind::Google => "google",
             ProviderKind::Xai => "xai",
-            ProviderKind::Custom => "custom",
         }
     }
 
     pub fn label_zh(self) -> &'static str {
         match self {
             ProviderKind::OpenAi => "OpenAI / Image2",
-            ProviderKind::Google => "Google / Gemini / Veo",
+            ProviderKind::Google => "Google / Veo",
             ProviderKind::Xai => "xAI / Grok",
-            ProviderKind::Custom => "自定义",
         }
     }
 }
@@ -120,8 +117,27 @@ impl FromStr for ProviderKind {
             "openai" | "image2" | "gpt" => Ok(ProviderKind::OpenAi),
             "google" | "gemini" | "veo" | "omni" => Ok(ProviderKind::Google),
             "xai" | "grok" => Ok(ProviderKind::Xai),
-            "custom" => Ok(ProviderKind::Custom),
+            // legacy "custom" maps to OpenAI family with custom mode
+            "custom" => Ok(ProviderKind::OpenAi),
             _ => bail!("unknown provider: {s}"),
+        }
+    }
+}
+
+/// Official cloud API vs user-defined proxy / self-host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointMode {
+    #[default]
+    Official,
+    Custom,
+}
+
+impl EndpointMode {
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            EndpointMode::Official => "官方",
+            EndpointMode::Custom => "自定义",
         }
     }
 }
@@ -133,46 +149,51 @@ pub struct ProjectConfig {
     /// e.g. "16:9" or "9:16"
     pub aspect: String,
 
-    // --- OpenAI / Image2 (chat + image, OpenAI-compatible) ---
+    // --- OpenAI / Image2 ---
+    #[serde(default)]
+    pub openai_mode: EndpointMode,
     #[serde(default = "default_openai_image_model")]
     pub openai_image_model: String,
     #[serde(default = "default_openai_chat_model")]
     pub openai_chat_model: String,
+    /// Used when openai_mode = Custom (OpenAI-compatible base)
+    #[serde(default = "default_openai_custom_base")]
+    pub openai_custom_base_url: String,
+    /// Legacy field — kept for older project.toml; ignored when openai_mode present
     #[serde(default = "default_openai_base_url")]
     pub openai_base_url: String,
 
-    // --- Google / Gemini / Veo (video; historically called "omni") ---
+    // --- Google / Gemini / Veo ---
+    #[serde(default)]
+    pub google_mode: EndpointMode,
     #[serde(default = "default_google_video_model")]
     pub google_video_model: String,
+    #[serde(default = "default_google_chat_model")]
+    pub google_chat_model: String,
+    #[serde(default = "default_google_image_model")]
+    pub google_image_model: String,
+    #[serde(default = "default_google_custom_base")]
+    pub google_custom_base_url: String,
     #[serde(default = "default_google_base_url")]
     pub google_base_url: String,
 
-    // --- xAI / Grok (OpenAI-compatible image/chat; optional video base) ---
-    #[serde(default = "default_xai_base_url")]
-    pub xai_base_url: String,
+    // --- xAI / Grok ---
+    #[serde(default)]
+    pub xai_mode: EndpointMode,
     #[serde(default = "default_xai_chat_model")]
     pub xai_chat_model: String,
     #[serde(default = "default_xai_image_model")]
     pub xai_image_model: String,
     #[serde(default = "default_xai_video_model")]
     pub xai_video_model: String,
-    /// Optional separate video base (if empty, reuse xai_base_url)
+    #[serde(default = "default_xai_custom_base")]
+    pub xai_custom_base_url: String,
+    #[serde(default = "default_xai_base_url")]
+    pub xai_base_url: String,
     #[serde(default)]
     pub xai_video_base_url: String,
 
-    // --- Custom OpenAI-compatible endpoints ---
-    #[serde(default = "default_custom_base_url")]
-    pub custom_base_url: String,
-    #[serde(default)]
-    pub custom_chat_model: String,
-    #[serde(default)]
-    pub custom_image_model: String,
-    #[serde(default)]
-    pub custom_video_model: String,
-    #[serde(default)]
-    pub custom_video_base_url: String,
-
-    // --- Capability → provider routing ---
+    // --- Capability → provider family ---
     #[serde(default)]
     pub chat_provider: ProviderKind,
     #[serde(default)]
@@ -190,14 +211,29 @@ fn default_openai_chat_model() -> String {
 fn default_openai_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
+fn default_openai_custom_base() -> String {
+    "http://127.0.0.1:8080/v1".into()
+}
 fn default_google_video_model() -> String {
     "veo-3.1-generate-preview".into()
+}
+fn default_google_chat_model() -> String {
+    "gemini-2.0-flash".into()
+}
+fn default_google_image_model() -> String {
+    "imagen-3.0-generate-002".into()
 }
 fn default_google_base_url() -> String {
     "https://generativelanguage.googleapis.com/v1beta".into()
 }
+fn default_google_custom_base() -> String {
+    "http://127.0.0.1:8081/v1beta".into()
+}
 fn default_xai_base_url() -> String {
     "https://api.x.ai/v1".into()
+}
+fn default_xai_custom_base() -> String {
+    "http://127.0.0.1:8082/v1".into()
 }
 fn default_xai_chat_model() -> String {
     "grok-2-latest".into()
@@ -208,12 +244,13 @@ fn default_xai_image_model() -> String {
 fn default_xai_video_model() -> String {
     "grok-video".into()
 }
-fn default_custom_base_url() -> String {
-    "http://127.0.0.1:8080/v1".into()
-}
 fn default_video_provider() -> ProviderKind {
     ProviderKind::Google
 }
+
+pub const OPENAI_OFFICIAL_BASE: &str = "https://api.openai.com/v1";
+pub const GOOGLE_OFFICIAL_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub const XAI_OFFICIAL_BASE: &str = "https://api.x.ai/v1";
 
 impl Default for ProjectConfig {
     fn default() -> Self {
@@ -221,21 +258,24 @@ impl Default for ProjectConfig {
             name: "untitled".into(),
             style: "cinematic, photorealistic, film grain".into(),
             aspect: "16:9".into(),
+            openai_mode: EndpointMode::Official,
             openai_image_model: default_openai_image_model(),
             openai_chat_model: default_openai_chat_model(),
+            openai_custom_base_url: default_openai_custom_base(),
             openai_base_url: default_openai_base_url(),
+            google_mode: EndpointMode::Official,
             google_video_model: default_google_video_model(),
+            google_chat_model: default_google_chat_model(),
+            google_image_model: default_google_image_model(),
+            google_custom_base_url: default_google_custom_base(),
             google_base_url: default_google_base_url(),
-            xai_base_url: default_xai_base_url(),
+            xai_mode: EndpointMode::Official,
             xai_chat_model: default_xai_chat_model(),
             xai_image_model: default_xai_image_model(),
             xai_video_model: default_xai_video_model(),
+            xai_custom_base_url: default_xai_custom_base(),
+            xai_base_url: default_xai_base_url(),
             xai_video_base_url: String::new(),
-            custom_base_url: default_custom_base_url(),
-            custom_chat_model: String::new(),
-            custom_image_model: String::new(),
-            custom_video_model: String::new(),
-            custom_video_base_url: String::new(),
             chat_provider: ProviderKind::OpenAi,
             image_provider: ProviderKind::OpenAi,
             video_provider: ProviderKind::Google,
@@ -432,165 +472,171 @@ impl Project {
         }
     }
 
-    pub fn openai_key() -> Result<String> {
-        first_nonempty_env(&["OPENAI_API_KEY", "ADRAMA_OPENAI_API_KEY"])
-            .context("OPENAI_API_KEY not set（请在「设置」中填写 Image2 / OpenAI Key）")
+    pub fn openai_key(mode: EndpointMode) -> Result<String> {
+        match mode {
+            EndpointMode::Official => first_nonempty_env(&["OPENAI_API_KEY", "ADRAMA_OPENAI_API_KEY"])
+                .context("未设置 OpenAI 官方 Key（设置 → OpenAI / Image2 → 官方密钥）"),
+            EndpointMode::Custom => first_nonempty_env(&[
+                "ADRAMA_OPENAI_CUSTOM_KEY",
+                "OPENAI_API_KEY",
+            ])
+            .context("未设置 OpenAI 自定义 Key（设置 → OpenAI / Image2 → 自定义密钥）"),
+        }
     }
 
-    pub fn gemini_key() -> Result<String> {
-        first_nonempty_env(&["GEMINI_API_KEY", "GOOGLE_API_KEY", "ADRAMA_GEMINI_API_KEY"])
-            .context("GEMINI_API_KEY not set（请在「设置」中填写 Google / Veo / Omni Key）")
+    pub fn google_key(mode: EndpointMode) -> Result<String> {
+        match mode {
+            EndpointMode::Official => first_nonempty_env(&[
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "ADRAMA_GEMINI_API_KEY",
+            ])
+            .context("未设置 Google 官方 Key（设置 → Google / Veo → 官方密钥）"),
+            EndpointMode::Custom => first_nonempty_env(&[
+                "ADRAMA_GOOGLE_CUSTOM_KEY",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+            ])
+            .context("未设置 Google 自定义 Key（设置 → Google / Veo → 自定义密钥）"),
+        }
     }
 
-    pub fn xai_key() -> Result<String> {
-        first_nonempty_env(&["XAI_API_KEY", "GROK_API_KEY", "ADRAMA_XAI_API_KEY"])
-            .context("XAI_API_KEY not set（请在「设置」中填写 Grok / xAI Key）")
-    }
-
-    pub fn custom_key() -> Result<String> {
-        first_nonempty_env(&["ADRAMA_CUSTOM_API_KEY", "CUSTOM_API_KEY"])
-            .context("ADRAMA_CUSTOM_API_KEY not set（请在「设置」中填写自定义 Key）")
-    }
-
-    /// Chat / LLM endpoint according to `chat_provider`.
-    pub fn resolve_chat(&self) -> Result<ResolvedEndpoint> {
-        self.resolve_openai_style(self.config.chat_provider, EndpointRole::Chat)
-    }
-
-    /// Image generation endpoint according to `image_provider`.
-    pub fn resolve_image(&self) -> Result<ResolvedEndpoint> {
-        self.resolve_openai_style(self.config.image_provider, EndpointRole::Image)
-    }
-
-    /// Video generation endpoint according to `video_provider`.
-    pub fn resolve_video(&self) -> Result<ResolvedEndpoint> {
-        let p = self.config.video_provider;
-        match p {
-            ProviderKind::OpenAi => Ok(ResolvedEndpoint {
-                provider: p,
-                base_url: self.config.openai_base_url.clone(),
-                model: self.config.openai_image_model.clone(),
-                api_key: Self::openai_key()?,
-            }),
-            ProviderKind::Google => Ok(ResolvedEndpoint {
-                provider: p,
-                base_url: self.config.google_base_url.clone(),
-                model: self.config.google_video_model.clone(),
-                api_key: Self::gemini_key()?,
-            }),
-            ProviderKind::Xai => {
-                let base = if self.config.xai_video_base_url.trim().is_empty() {
-                    self.config.xai_base_url.clone()
-                } else {
-                    self.config.xai_video_base_url.clone()
-                };
-                Ok(ResolvedEndpoint {
-                    provider: p,
-                    base_url: base,
-                    model: self.config.xai_video_model.clone(),
-                    api_key: Self::xai_key()?,
-                })
+    pub fn xai_key(mode: EndpointMode) -> Result<String> {
+        match mode {
+            EndpointMode::Official => {
+                first_nonempty_env(&["XAI_API_KEY", "GROK_API_KEY", "ADRAMA_XAI_API_KEY"])
+                    .context("未设置 Grok 官方 Key（设置 → xAI / Grok → 官方密钥）")
             }
-            ProviderKind::Custom => {
-                let base = if self.config.custom_video_base_url.trim().is_empty() {
-                    self.config.custom_base_url.clone()
-                } else {
-                    self.config.custom_video_base_url.clone()
-                };
-                let model = if self.config.custom_video_model.trim().is_empty() {
-                    self.config.google_video_model.clone()
-                } else {
-                    self.config.custom_video_model.clone()
-                };
-                Ok(ResolvedEndpoint {
-                    provider: p,
-                    base_url: base,
-                    model,
-                    api_key: Self::custom_key()?,
-                })
+            EndpointMode::Custom => {
+                first_nonempty_env(&["ADRAMA_XAI_CUSTOM_KEY", "XAI_API_KEY", "GROK_API_KEY"])
+                    .context("未设置 Grok 自定义 Key（设置 → xAI / Grok → 自定义密钥）")
             }
         }
     }
 
-    fn resolve_openai_style(
+    fn openai_base(&self) -> String {
+        match self.config.openai_mode {
+            EndpointMode::Official => OPENAI_OFFICIAL_BASE.to_string(),
+            EndpointMode::Custom => {
+                let u = self.config.openai_custom_base_url.trim();
+                if u.is_empty() {
+                    self.config.openai_base_url.clone()
+                } else {
+                    u.to_string()
+                }
+            }
+        }
+    }
+
+    fn google_base(&self) -> String {
+        match self.config.google_mode {
+            EndpointMode::Official => GOOGLE_OFFICIAL_BASE.to_string(),
+            EndpointMode::Custom => {
+                let u = self.config.google_custom_base_url.trim();
+                if u.is_empty() {
+                    self.config.google_base_url.clone()
+                } else {
+                    u.to_string()
+                }
+            }
+        }
+    }
+
+    fn xai_base(&self) -> String {
+        match self.config.xai_mode {
+            EndpointMode::Official => XAI_OFFICIAL_BASE.to_string(),
+            EndpointMode::Custom => {
+                let u = self.config.xai_custom_base_url.trim();
+                if u.is_empty() {
+                    self.config.xai_base_url.clone()
+                } else {
+                    u.to_string()
+                }
+            }
+        }
+    }
+
+    /// Chat / LLM endpoint according to `chat_provider` + that family's mode.
+    pub fn resolve_chat(&self) -> Result<ResolvedEndpoint> {
+        self.resolve_role(self.config.chat_provider, EndpointRole::Chat)
+    }
+
+    /// Image generation endpoint.
+    pub fn resolve_image(&self) -> Result<ResolvedEndpoint> {
+        self.resolve_role(self.config.image_provider, EndpointRole::Image)
+    }
+
+    /// Video generation endpoint.
+    pub fn resolve_video(&self) -> Result<ResolvedEndpoint> {
+        self.resolve_role(self.config.video_provider, EndpointRole::Video)
+    }
+
+    fn resolve_role(
         &self,
         provider: ProviderKind,
         role: EndpointRole,
     ) -> Result<ResolvedEndpoint> {
         match provider {
-            ProviderKind::OpenAi | ProviderKind::Google => {
-                // Google chat/image still via OpenAI-compatible if user points openai url;
-                // default chat/image stay on OpenAI fields when provider is OpenAi.
-                // If user selects Google for chat/image, reuse google base with gemini key
-                // (many proxies expose OpenAI-compatible routes).
-                if provider == ProviderKind::Google {
-                    let model = match role {
-                        EndpointRole::Chat => self.config.openai_chat_model.clone(),
-                        EndpointRole::Image => self.config.openai_image_model.clone(),
-                    };
-                    Ok(ResolvedEndpoint {
-                        provider,
-                        base_url: self.config.google_base_url.clone(),
-                        model,
-                        api_key: Self::gemini_key()?,
-                    })
-                } else {
-                    let model = match role {
-                        EndpointRole::Chat => self.config.openai_chat_model.clone(),
-                        EndpointRole::Image => self.config.openai_image_model.clone(),
-                    };
-                    Ok(ResolvedEndpoint {
-                        provider: ProviderKind::OpenAi,
-                        base_url: self.config.openai_base_url.clone(),
-                        model,
-                        api_key: Self::openai_key()?,
-                    })
-                }
+            ProviderKind::OpenAi => {
+                let mode = self.config.openai_mode;
+                let model = match role {
+                    EndpointRole::Chat => self.config.openai_chat_model.clone(),
+                    EndpointRole::Image | EndpointRole::Video => {
+                        self.config.openai_image_model.clone()
+                    }
+                };
+                Ok(ResolvedEndpoint {
+                    provider,
+                    base_url: self.openai_base(),
+                    model,
+                    api_key: Self::openai_key(mode)?,
+                })
+            }
+            ProviderKind::Google => {
+                let mode = self.config.google_mode;
+                let model = match role {
+                    EndpointRole::Chat => self.config.google_chat_model.clone(),
+                    EndpointRole::Image => self.config.google_image_model.clone(),
+                    EndpointRole::Video => self.config.google_video_model.clone(),
+                };
+                Ok(ResolvedEndpoint {
+                    provider,
+                    base_url: self.google_base(),
+                    model,
+                    api_key: Self::google_key(mode)?,
+                })
             }
             ProviderKind::Xai => {
+                let mode = self.config.xai_mode;
                 let model = match role {
                     EndpointRole::Chat => self.config.xai_chat_model.clone(),
                     EndpointRole::Image => self.config.xai_image_model.clone(),
+                    EndpointRole::Video => self.config.xai_video_model.clone(),
+                };
+                let base = if role == EndpointRole::Video
+                    && !self.config.xai_video_base_url.trim().is_empty()
+                    && mode == EndpointMode::Custom
+                {
+                    self.config.xai_video_base_url.clone()
+                } else {
+                    self.xai_base()
                 };
                 Ok(ResolvedEndpoint {
                     provider,
-                    base_url: self.config.xai_base_url.clone(),
+                    base_url: base,
                     model,
-                    api_key: Self::xai_key()?,
-                })
-            }
-            ProviderKind::Custom => {
-                let model = match role {
-                    EndpointRole::Chat => {
-                        if self.config.custom_chat_model.trim().is_empty() {
-                            self.config.openai_chat_model.clone()
-                        } else {
-                            self.config.custom_chat_model.clone()
-                        }
-                    }
-                    EndpointRole::Image => {
-                        if self.config.custom_image_model.trim().is_empty() {
-                            self.config.openai_image_model.clone()
-                        } else {
-                            self.config.custom_image_model.clone()
-                        }
-                    }
-                };
-                Ok(ResolvedEndpoint {
-                    provider,
-                    base_url: self.config.custom_base_url.clone(),
-                    model,
-                    api_key: Self::custom_key()?,
+                    api_key: Self::xai_key(mode)?,
                 })
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRole {
     Chat,
     Image,
+    Video,
 }
 
 fn first_nonempty_env(keys: &[&str]) -> Option<String> {

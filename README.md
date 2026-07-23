@@ -69,15 +69,23 @@ adrama --gui --project ./my-drama
 
 密钥保存在本机 `~/.config/adrama/settings.json`（Windows: `%APPDATA%\adrama\settings.json`），不写进项目目录。
 
+### API 密钥：官方 / 自定义（每种独立）
+
+| 厂商 | 官方 Key | 自定义 Key | 官方 Base URL |
+|------|----------|------------|---------------|
+| OpenAI / Image2 | `OPENAI_API_KEY` | `ADRAMA_OPENAI_CUSTOM_KEY` | `https://api.openai.com/v1` |
+| Google / Veo | `GEMINI_API_KEY` | `ADRAMA_GOOGLE_CUSTOM_KEY` | Gemini `v1beta` |
+| xAI / Grok | `XAI_API_KEY` | `ADRAMA_XAI_CUSTOM_KEY` | `https://api.x.ai/v1` |
+
+在 GUI **设置 → API 密钥** 中为每家切换「官方 / 自定义」，自定义模式可填代理 URL；两套密钥互不影响。
+
+**能力路由**（设置 → 能力路由）：对话 / 图像 / 视频 可分别指定使用 OpenAI、Google 或 Grok。
+
 ### 其它 GUI 能力
 
-- **中文字体**：自动加载系统 CJK 字体（Windows 雅黑 / Linux Noto CJK 等）
-- **取消任务**：运行中可点顶栏「取消任务」
-- **剧本编辑**：可直接改写并保存到 `script/`
-- **图片预览**：资产/分镜缩略图单击预览、可外开
-- **最近项目**：总览页快速打开
-- **连接测试**：设置页分别测试 Image2 / Veo / Grok / 自定义端点
-- **API 重试**：聊天与图像请求遇 429/5xx/超时自动重试
+- 深色主题侧栏导航、卡片式页面、工作流画布
+- 中文字体自动加载 · 取消任务 · 剧本编辑保存
+- 图片预览 · 最近项目 · 连接测试 · API 自动重试
 
 ## 命令行
 
