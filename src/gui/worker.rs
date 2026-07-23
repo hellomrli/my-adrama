@@ -28,7 +28,7 @@ pub enum Job {
         dry_run: bool,
     },
     Approve { stage: Stage },
-    /// Lightweight connectivity probe for settings UI.
+    /// Probe API key + endpoint availability for settings UI.
     TestEndpoint {
         kind: String,
         base_url: String,
@@ -197,7 +197,7 @@ fn job_label(job: &Job) -> String {
             }
         }
         Job::Approve { stage } => format!("审核通过 {stage}"),
-        Job::TestEndpoint { kind, .. } => format!("测试连接 · {kind}"),
+        Job::TestEndpoint { kind, .. } => format!("测试 Key · {kind}"),
     }
 }
 
@@ -304,75 +304,118 @@ async fn test_endpoint(
     msg_tx: &Sender<WorkerMsg>,
 ) -> anyhow::Result<String> {
     let base = base_url.trim().trim_end_matches('/');
+    let key = api_key.trim();
     if base.is_empty() {
         anyhow::bail!("Base URL 为空");
     }
-    if api_key.trim().is_empty() {
+    if key.is_empty() {
         anyhow::bail!("API Key 为空");
     }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(25))
         .build()?;
 
-    let _ = msg_tx.send(WorkerMsg::Log(format!("测试 {kind}: {base}")));
+    let masked = mask_key(key);
+    let _ = msg_tx.send(WorkerMsg::Log(format!(
+        "测试 {kind}\n  URL: {base}\n  Key: {masked}"
+    )));
 
-    // Google / Gemini style
-    if kind.contains("Google") || kind.contains("Veo") || kind.contains("Gemini") {
-        let url = format!("{base}/models?key={api_key}");
+    let is_google = kind.contains("Google") || kind.contains("Veo") || kind.contains("Gemini");
+
+    if is_google {
+        // 1) List models — validates key against Gemini API
+        let url = format!("{base}/models?key={key}&pageSize=5");
         let resp = client.get(&url).send().await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 400 || status.as_u16() == 401 || status.as_u16() == 403 {
+            anyhow::bail!(
+                "Key 无效或无权限（HTTP {status}）：{}",
+                truncate(&text, 180)
+            );
+        }
         if !status.is_success() {
             anyhow::bail!("连接失败 HTTP {status}: {}", truncate(&text, 200));
         }
-        return Ok(format!("Google 端点可用（HTTP {status}）"));
+        let count = text.matches("\"name\"").count();
+        return Ok(format!(
+            "✓ {kind} Key 可用（HTTP {status}，列出约 {count} 个模型资源）"
+        ));
     }
 
-    // OpenAI-compatible: models list
-    let url = format!("{base}/models");
+    // OpenAI-compatible (OpenAI / xAI / custom proxies)
+    let models_url = format!("{base}/models");
     let resp = client
-        .get(&url)
-        .bearer_auth(api_key.trim())
+        .get(&models_url)
+        .bearer_auth(key)
         .send()
         .await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        anyhow::bail!(
+            "Key 无效或无权限（HTTP {status}）：{}",
+            truncate(&text, 180)
+        );
+    }
+
     if status.is_success() {
+        let model_count = text.matches("\"id\"").count().max(text.matches("\"object\"").count() / 2);
         let hint = if !model.is_empty() {
-            format!("，当前模型配置：{model}")
+            format!("，配置模型：{model}")
         } else {
             String::new()
         };
-        return Ok(format!("端点可用（HTTP {status}）{hint}"));
+        return Ok(format!(
+            "✓ {kind} Key 可用（HTTP {status}，/models 正常{hint}，约 {model_count} 条 id）"
+        ));
     }
 
-    // Some proxies don't expose /models — try a minimal chat probe only if chat-ish
-    if status.as_u16() == 404 {
-        let chat_url = format!("{base}/chat/completions");
-        let body = serde_json::json!({
-            "model": if model.is_empty() { "test" } else { model },
-            "messages": [{"role":"user","content":"ping"}],
-            "max_tokens": 1
-        });
-        let resp = client
-            .post(&chat_url)
-            .bearer_auth(api_key.trim())
-            .json(&body)
-            .send()
-            .await?;
-        let st = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        // 400/401/429 at least proves reachability + auth path
-        if st.is_success() || st.as_u16() == 400 || st.as_u16() == 401 || st.as_u16() == 429 {
-            return Ok(format!(
-                "端点可达（/models 404，chat 探测 HTTP {st}）"
-            ));
-        }
-        anyhow::bail!("连接失败 HTTP {st}: {}", truncate(&t, 200));
+    // Fallback: chat completions probe (some proxies omit /models)
+    let chat_url = format!("{base}/chat/completions");
+    let body = serde_json::json!({
+        "model": if model.is_empty() { "gpt-4o-mini" } else { model },
+        "messages": [{"role":"user","content":"ping"}],
+        "max_tokens": 1
+    });
+    let resp = client
+        .post(&chat_url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await?;
+    let st = resp.status();
+    let t = resp.text().await.unwrap_or_default();
+
+    if st.as_u16() == 401 || st.as_u16() == 403 {
+        anyhow::bail!("Key 无效或无权限（HTTP {st}）：{}", truncate(&t, 180));
+    }
+    // 200 = fully works; 400 = auth ok but bad request/model; 429 = auth ok, rate limited
+    if st.is_success() {
+        return Ok(format!("✓ {kind} Key 可用（chat 探测成功 HTTP {st}）"));
+    }
+    if st.as_u16() == 400 || st.as_u16() == 404 || st.as_u16() == 429 {
+        return Ok(format!(
+            "✓ {kind} Key 认证通过（chat 探测 HTTP {st}，端点可达；若模型名不对可忽略）"
+        ));
     }
 
-    anyhow::bail!("连接失败 HTTP {status}: {}", truncate(&text, 200));
+    anyhow::bail!(
+        "连接失败 HTTP {status}（/models），chat 探测 HTTP {st}: {}",
+        truncate(&t, 160)
+    );
+}
+
+fn mask_key(key: &str) -> String {
+    let k = key.trim();
+    if k.len() <= 8 {
+        return "****".into();
+    }
+    let head: String = k.chars().take(4).collect();
+    let tail: String = k.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    format!("{head}…{tail} ({} 字符)", k.chars().count())
 }
 
 fn truncate(s: &str, max: usize) -> String {

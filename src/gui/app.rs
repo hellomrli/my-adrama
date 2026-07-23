@@ -436,13 +436,13 @@ impl AdramaApp {
         }
     }
 
-    fn resolved_key_url_for_test(
+    fn resolved_key_url(
         &self,
         family: ProviderKind,
-    ) -> (String, String, String, EndpointMode) {
+        mode: EndpointMode,
+    ) -> (String, String, String) {
         match family {
             ProviderKind::OpenAi => {
-                let mode = self.edit_config.openai_mode;
                 let url = match mode {
                     EndpointMode::Official => OPENAI_OFFICIAL_BASE.to_string(),
                     EndpointMode::Custom => self.edit_config.openai_custom_base_url.clone(),
@@ -451,15 +451,9 @@ impl AdramaApp {
                     EndpointMode::Official => self.app_settings.openai_official_key.clone(),
                     EndpointMode::Custom => self.app_settings.openai_custom_key.clone(),
                 };
-                (
-                    "OpenAI / Image2".into(),
-                    url,
-                    key,
-                    mode,
-                )
+                ("OpenAI / Image2".into(), url, key)
             }
             ProviderKind::Google => {
-                let mode = self.edit_config.google_mode;
                 let url = match mode {
                     EndpointMode::Official => GOOGLE_OFFICIAL_BASE.to_string(),
                     EndpointMode::Custom => self.edit_config.google_custom_base_url.clone(),
@@ -468,10 +462,9 @@ impl AdramaApp {
                     EndpointMode::Official => self.app_settings.google_official_key.clone(),
                     EndpointMode::Custom => self.app_settings.google_custom_key.clone(),
                 };
-                ("Google / Veo".into(), url, key, mode)
+                ("Google / Veo".into(), url, key)
             }
             ProviderKind::Xai => {
-                let mode = self.edit_config.xai_mode;
                 let url = match mode {
                     EndpointMode::Official => XAI_OFFICIAL_BASE.to_string(),
                     EndpointMode::Custom => self.edit_config.xai_custom_base_url.clone(),
@@ -480,7 +473,7 @@ impl AdramaApp {
                     EndpointMode::Official => self.app_settings.xai_official_key.clone(),
                     EndpointMode::Custom => self.app_settings.xai_custom_key.clone(),
                 };
-                ("xAI / Grok".into(), url, key, mode)
+                ("xAI / Grok".into(), url, key)
             }
         }
     }
@@ -1212,11 +1205,12 @@ impl AdramaApp {
         ui.add_space(8.0);
 
         let mut dirty = self.settings_dirty;
-        let mut test_openai = false;
-        let mut test_google = false;
-        let mut test_xai = false;
+        // (family, mode) to test — mode forces which key/url pair
+        let mut pending_test: Option<(ProviderKind, EndpointMode)> = None;
 
         theme::card_frame().show(ui, |ui| {
+            let mut test_official = false;
+            let mut test_custom = false;
             vendor_key_card_ui(
                 ui,
                 "OpenAI / Image2",
@@ -1229,11 +1223,19 @@ impl AdramaApp {
                 &mut self.edit_config.openai_custom_base_url,
                 !self.busy,
                 &mut dirty,
-                &mut test_openai,
+                &mut test_official,
+                &mut test_custom,
             );
+            if test_official {
+                pending_test = Some((ProviderKind::OpenAi, EndpointMode::Official));
+            } else if test_custom {
+                pending_test = Some((ProviderKind::OpenAi, EndpointMode::Custom));
+            }
         });
         ui.add_space(10.0);
         theme::card_frame().show(ui, |ui| {
+            let mut test_official = false;
+            let mut test_custom = false;
             vendor_key_card_ui(
                 ui,
                 "Google / Gemini / Veo",
@@ -1246,11 +1248,19 @@ impl AdramaApp {
                 &mut self.edit_config.google_custom_base_url,
                 !self.busy,
                 &mut dirty,
-                &mut test_google,
+                &mut test_official,
+                &mut test_custom,
             );
+            if test_official {
+                pending_test = Some((ProviderKind::Google, EndpointMode::Official));
+            } else if test_custom {
+                pending_test = Some((ProviderKind::Google, EndpointMode::Custom));
+            }
         });
         ui.add_space(10.0);
         theme::card_frame().show(ui, |ui| {
+            let mut test_official = false;
+            let mut test_custom = false;
             vendor_key_card_ui(
                 ui,
                 "xAI / Grok",
@@ -1263,19 +1273,19 @@ impl AdramaApp {
                 &mut self.edit_config.xai_custom_base_url,
                 !self.busy,
                 &mut dirty,
-                &mut test_xai,
+                &mut test_official,
+                &mut test_custom,
             );
+            if test_official {
+                pending_test = Some((ProviderKind::Xai, EndpointMode::Official));
+            } else if test_custom {
+                pending_test = Some((ProviderKind::Xai, EndpointMode::Custom));
+            }
         });
         self.settings_dirty = dirty;
 
-        if test_openai {
-            self.run_connection_test(ProviderKind::OpenAi);
-        }
-        if test_google {
-            self.run_connection_test(ProviderKind::Google);
-        }
-        if test_xai {
-            self.run_connection_test(ProviderKind::Xai);
+        if let Some((family, mode)) = pending_test {
+            self.run_connection_test(family, mode);
         }
 
         ui.add_space(12.0);
@@ -1296,14 +1306,22 @@ impl AdramaApp {
         });
     }
 
-    fn run_connection_test(&mut self, family: ProviderKind) {
+    fn run_connection_test(&mut self, family: ProviderKind, mode: EndpointMode) {
         self.app_settings.apply_to_env();
-        let (kind, base_url, api_key, mode) = self.resolved_key_url_for_test(family);
+        let (kind, base_url, api_key) = self.resolved_key_url(family, mode);
         let model = match family {
             ProviderKind::OpenAi => self.edit_config.openai_chat_model.clone(),
-            ProviderKind::Google => self.edit_config.google_video_model.clone(),
+            ProviderKind::Google => self.edit_config.google_chat_model.clone(),
             ProviderKind::Xai => self.edit_config.xai_chat_model.clone(),
         };
+        if api_key.trim().is_empty() {
+            self.error_msg = format!(
+                "{}「{}」密钥为空，请先填写再测试",
+                kind,
+                mode.label_zh()
+            );
+            return;
+        }
         self.submit(Job::TestEndpoint {
             kind: format!("{kind} · {}", mode.label_zh()),
             base_url,
@@ -1535,7 +1553,8 @@ fn vendor_key_card_ui(
     custom_url: &mut String,
     can_test: bool,
     dirty: &mut bool,
-    test_clicked: &mut bool,
+    test_official: &mut bool,
+    test_custom: &mut bool,
 ) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
@@ -1554,70 +1573,81 @@ fn vendor_key_card_ui(
         }
     });
 
-    ui.add_space(6.0);
-    match *mode {
-        EndpointMode::Official => {
-            ui.label(
-                RichText::new(format!("官方地址：{official_url}"))
-                    .small()
-                    .monospace()
-                    .color(theme::TEXT_DIM),
-            );
-            ui.horizontal(|ui| {
-                ui.set_min_width(100.0);
-                ui.label("官方密钥");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(official_key)
-                            .password(true)
-                            .desired_width(360.0)
-                            .hint_text("sk-... / AIza..."),
-                    )
-                    .changed()
-                {
-                    *dirty = true;
-                }
-            });
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(format!("官方地址：{official_url}"))
+            .small()
+            .monospace()
+            .color(theme::TEXT_DIM),
+    );
+    ui.horizontal(|ui| {
+        ui.set_min_width(88.0);
+        ui.label("官方密钥");
+        if ui
+            .add(
+                egui::TextEdit::singleline(official_key)
+                    .password(true)
+                    .desired_width(320.0)
+                    .hint_text("sk-... / AIza..."),
+            )
+            .changed()
+        {
+            *dirty = true;
         }
-        EndpointMode::Custom => {
-            ui.horizontal(|ui| {
-                ui.set_min_width(100.0);
-                ui.label("自定义 URL");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(custom_url)
-                            .desired_width(360.0)
-                            .hint_text("https://proxy.example.com/v1"),
-                    )
-                    .changed()
-                {
-                    *dirty = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.set_min_width(100.0);
-                ui.label("自定义密钥");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(custom_key)
-                            .password(true)
-                            .desired_width(360.0),
-                    )
-                    .changed()
-                {
-                    *dirty = true;
-                }
-            });
+        if ui
+            .add_enabled(
+                can_test && !official_key.trim().is_empty(),
+                egui::Button::new("测试"),
+            )
+            .on_hover_text("用官方地址验证此 Key 是否可用")
+            .clicked()
+        {
+            *test_official = true;
         }
-    }
+    });
 
     ui.add_space(6.0);
-    if ui
-        .add_enabled(can_test, egui::Button::new("测试当前模式连接"))
-        .clicked()
-    {
-        *test_clicked = true;
-    }
+    ui.horizontal(|ui| {
+        ui.set_min_width(88.0);
+        ui.label("自定义 URL");
+        if ui
+            .add(
+                egui::TextEdit::singleline(custom_url)
+                    .desired_width(320.0)
+                    .hint_text("https://proxy.example.com/v1"),
+            )
+            .changed()
+        {
+            *dirty = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.set_min_width(88.0);
+        ui.label("自定义密钥");
+        if ui
+            .add(
+                egui::TextEdit::singleline(custom_key)
+                    .password(true)
+                    .desired_width(320.0)
+                    .hint_text("代理 / 自建服务 Key"),
+            )
+            .changed()
+        {
+            *dirty = true;
+        }
+        if ui
+            .add_enabled(
+                can_test
+                    && !custom_key.trim().is_empty()
+                    && !custom_url.trim().is_empty(),
+                egui::Button::new("测试"),
+            )
+            .on_hover_text("用自定义 URL 验证此 Key 是否可用")
+            .clicked()
+        {
+            *test_custom = true;
+        }
+    });
 }
 
 fn labeled_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
