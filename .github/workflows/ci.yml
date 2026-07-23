@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev pkg-config \
+            libgtk-3-dev libayatana-appindicator3-dev
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package .deb
+        run: ./scripts/package-deb.sh
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: |
+            dist/*.deb
+            target/release/adrama
+          if-no-files-found: error
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Stage Windows package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/adrama.exe dist/
+          cat > dist/README.txt << 'EOF'
+          adrama / my-adrama — AI short-drama workflow (GUI + CLI)
+
+          Double-click adrama.exe to open the GUI.
+          CLI: adrama.exe --help
+
+          Env: OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY
+          Optional: ffmpeg on PATH for video concat
+          EOF
+          (cd dist && powershell -Command "Compress-Archive -Path * -DestinationPath ../adrama-windows-x86_64.zip -Force")
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist/adrama.exe
+            adrama-windows-x86_64.zip
+          if-no-files-found: error

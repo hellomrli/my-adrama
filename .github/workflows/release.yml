@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the release (e.g. 0.1.0)"
+        required: true
+        default: "0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/adrama.exe dist/
+          cat > dist/README.txt << 'EOF'
+          adrama / my-adrama — AI short-drama workflow (GUI + CLI)
+          Double-click adrama.exe for GUI. Env: OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY
+          EOF
+          (cd dist && powershell -Command "Compress-Archive -Path * -DestinationPath ../adrama-windows-x86_64.zip -Force")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/adrama.exe
+            adrama-windows-x86_64.zip
+
+  linux-deb:
+    name: Linux .deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev pkg-config \
+            libgtk-3-dev libayatana-appindicator3-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: ./scripts/package-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/*.deb
+            target/release/adrama
+
+  publish:
+    name: Create GitHub Release
+    needs: [windows, linux-deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.deb' -o -name 'adrama' \) -print
+          cp -v artifacts/release-windows/adrama.exe release-assets/ || true
+          cp -v artifacts/release-windows/adrama-windows-x86_64.zip release-assets/ || true
+          cp -v artifacts/release-linux/*.deb release-assets/ || true
+          if [[ -f artifacts/release-linux/adrama ]]; then
+            cp artifacts/release-linux/adrama release-assets/adrama-linux-x86_64
+            chmod +x release-assets/adrama-linux-x86_64
+          fi
+          ls -lah release-assets
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v${{ github.event.inputs.version }}"
+          fi
+          # Create tag on default branch tip if workflow_dispatch
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            git fetch --tags
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              git tag "$TAG"
+              git push origin "$TAG" || true
+            fi
+          fi
+          NOTES="## my-adrama ${TAG}
+
+          ### Downloads
+          - **Windows**: \`adrama.exe\` / \`adrama-windows-x86_64.zip\`
+          - **Linux deb**: \`*.deb\` (install with \`sudo dpkg -i …\`)
+          - **Linux binary**: \`adrama-linux-x86_64\`
+
+          GUI opens with no args. CLI: \`adrama --help\`
+          "
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "my-adrama ${TAG}" \
+              --notes "$NOTES"
+          fi

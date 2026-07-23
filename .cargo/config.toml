@@ -1,0 +1,10 @@
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-clang"
+ar = "x86_64-w64-mingw32-llvm-ar"
+# Static-link libunwind so Windows machines don't need libunwind.dll
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-lunwind",
+    "-C", "link-arg=-Wl,-Bdynamic",
+]

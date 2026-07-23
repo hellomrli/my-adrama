@@ -1,0 +1,10 @@
+/target
+/dist
+*.zip
+*.deb
+.env
+**/*.mp4
+*.png
+!docs/**
+.DS_Store
+*.swp
