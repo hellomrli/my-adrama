@@ -78,14 +78,18 @@ jobs:
         run: |
           mkdir -p release-assets
           find artifacts -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.deb' -o -name 'adrama' \) -print
-          cp -v artifacts/release-windows/adrama.exe release-assets/ || true
-          cp -v artifacts/release-windows/adrama-windows-x86_64.zip release-assets/ || true
-          cp -v artifacts/release-linux/*.deb release-assets/ || true
-          if [[ -f artifacts/release-linux/adrama ]]; then
-            cp artifacts/release-linux/adrama release-assets/adrama-linux-x86_64
+          # Artifacts may nest paths (dist/, target/release/) depending on upload globs
+          find artifacts -type f -name 'adrama.exe' -exec cp -v {} release-assets/ \;
+          find artifacts -type f -name 'adrama-windows-x86_64.zip' -exec cp -v {} release-assets/ \;
+          find artifacts -type f -name '*.deb' -exec cp -v {} release-assets/ \;
+          # Linux binary (avoid copying the .deb name collision)
+          while IFS= read -r f; do
+            cp -v "$f" release-assets/adrama-linux-x86_64
             chmod +x release-assets/adrama-linux-x86_64
-          fi
+          done < <(find artifacts -type f -name adrama ! -path '*.deb')
           ls -lah release-assets
+          test -f release-assets/adrama.exe
+          test -n "$(ls release-assets/*.deb 2>/dev/null)"
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
