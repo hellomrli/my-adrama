@@ -259,142 +259,101 @@ impl<'de> Deserialize<'de> for AspectRatio {
     }
 }
 
-/// Endpoint + model settings for a single vendor.
+/// 一种能力的完整端点配置：谁来做、连哪里、用哪个模型。
+///
+/// 三种能力各存一份，互不影响——同一家服务商在对话和生图上用不同中转、
+/// 不同额度、不同模型是常态，共享只会让人改了一处却影响到另一处。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderSettings {
+pub struct EndpointConfig {
+    pub provider: ProviderId,
     #[serde(default)]
     pub mode: EndpointMode,
-    /// Base URL used when `mode == Custom`.
+    /// `mode == Custom` 时使用的地址。
     #[serde(default)]
     pub custom_base_url: String,
     #[serde(default)]
-    pub chat_model: String,
-    #[serde(default)]
-    pub image_model: String,
-    #[serde(default)]
-    pub video_model: String,
-    /// Optional override for the video endpoint when a proxy splits traffic.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub video_base_url: String,
+    pub model: String,
 }
 
-impl ProviderSettings {
-    pub fn defaults_for(id: ProviderId) -> Self {
-        match id {
-            ProviderId::OpenAi => Self {
-                mode: EndpointMode::Official,
-                custom_base_url: "http://127.0.0.1:8080/v1".into(),
-                chat_model: "gpt-4.1".into(),
-                image_model: "gpt-image-1".into(),
-                video_model: String::new(),
-                video_base_url: String::new(),
-            },
-            ProviderId::Google => Self {
-                mode: EndpointMode::Official,
-                custom_base_url: "http://127.0.0.1:8081/v1beta".into(),
-                chat_model: "gemini-2.0-flash".into(),
-                image_model: "imagen-3.0-generate-002".into(),
-                video_model: "veo-3.1-generate-preview".into(),
-                video_base_url: String::new(),
-            },
-            ProviderId::Xai => Self {
-                mode: EndpointMode::Official,
-                custom_base_url: "http://127.0.0.1:8082/v1".into(),
-                chat_model: "grok-2-latest".into(),
-                image_model: "grok-2-image".into(),
-                video_model: String::new(),
-                video_base_url: String::new(),
-            },
-        }
-    }
-
-    pub fn model_for(&self, cap: Capability) -> &str {
+impl EndpointConfig {
+    pub fn defaults_for(cap: Capability) -> Self {
         match cap {
-            Capability::Chat => &self.chat_model,
-            Capability::Image => &self.image_model,
-            Capability::Video => &self.video_model,
+            Capability::Chat => Self {
+                provider: ProviderId::OpenAi,
+                mode: EndpointMode::Official,
+                custom_base_url: String::new(),
+                model: "gpt-4.1".into(),
+            },
+            Capability::Image => Self {
+                provider: ProviderId::OpenAi,
+                mode: EndpointMode::Official,
+                custom_base_url: String::new(),
+                model: "gpt-image-1".into(),
+            },
+            Capability::Video => Self {
+                provider: ProviderId::Google,
+                mode: EndpointMode::Official,
+                custom_base_url: String::new(),
+                model: "veo-3.1-generate-preview".into(),
+            },
         }
     }
 
-    pub fn model_for_mut(&mut self, cap: Capability) -> &mut String {
-        match cap {
-            Capability::Chat => &mut self.chat_model,
-            Capability::Image => &mut self.image_model,
-            Capability::Video => &mut self.video_model,
+    /// 该服务商在这种能力上的默认模型，用于切换服务商时给个合理起点。
+    pub fn default_model(provider: ProviderId, cap: Capability) -> &'static str {
+        match (provider, cap) {
+            (ProviderId::OpenAi, Capability::Chat) => "gpt-4.1",
+            (ProviderId::OpenAi, Capability::Image) => "gpt-image-1",
+            (ProviderId::Google, Capability::Chat) => "gemini-2.0-flash",
+            (ProviderId::Google, Capability::Image) => "imagen-3.0-generate-002",
+            (ProviderId::Google, Capability::Video) => "veo-3.1-generate-preview",
+            (ProviderId::Xai, Capability::Chat) => "grok-2-latest",
+            (ProviderId::Xai, Capability::Image) => "grok-2-image",
+            _ => "",
         }
     }
 
-    /// Effective base URL for a capability, honouring mode and per-capability
-    /// overrides. Trailing slashes are stripped so callers can always `format!`.
-    pub fn base_url(&self, id: ProviderId, cap: Capability) -> String {
+    /// 生效的 base URL；末尾斜杠已去掉，调用方可以直接 `format!`。
+    pub fn base_url(&self) -> String {
         let base = match self.mode {
-            EndpointMode::Official => id.official_base_url().to_string(),
+            EndpointMode::Official => self.provider.official_base_url().to_string(),
             EndpointMode::Custom => {
                 let custom = self.custom_base_url.trim();
                 if custom.is_empty() {
-                    id.official_base_url().to_string()
+                    self.provider.official_base_url().to_string()
                 } else {
                     custom.to_string()
                 }
             }
         };
-        if cap == Capability::Video && !self.video_base_url.trim().is_empty() {
-            return self.video_base_url.trim().trim_end_matches('/').to_string();
-        }
         base.trim_end_matches('/').to_string()
     }
-}
 
-/// Which provider serves each capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Routing {
-    pub chat: ProviderId,
-    pub image: ProviderId,
-    pub video: ProviderId,
-}
-
-impl Default for Routing {
-    fn default() -> Self {
-        Self {
-            chat: ProviderId::OpenAi,
-            image: ProviderId::OpenAi,
-            video: ProviderId::Google,
+    /// 换服务商：模型换成新家的默认值，自定义地址留给用户自己填。
+    pub fn switch_provider(&mut self, provider: ProviderId, cap: Capability) {
+        if self.provider == provider {
+            return;
         }
+        self.provider = provider;
+        self.model = Self::default_model(provider, cap).to_string();
+        self.custom_base_url.clear();
     }
 }
 
-impl Routing {
-    pub fn get(&self, cap: Capability) -> ProviderId {
-        match cap {
-            Capability::Chat => self.chat,
-            Capability::Image => self.image,
-            Capability::Video => self.video,
-        }
-    }
-
-    pub fn set(&mut self, cap: Capability, id: ProviderId) {
-        match cap {
-            Capability::Chat => self.chat = id,
-            Capability::Image => self.image = id,
-            Capability::Video => self.video = id,
-        }
-    }
-}
-
-/// Knobs that shape how aggressively the pipeline calls paid APIs.
+/// 生成相关的开关。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationSettings {
-    /// Parallel image requests (assets + storyboard).
+    /// 并行的图像请求数（资产 + 分镜）。
     pub image_concurrency: usize,
-    /// Parallel video jobs. Video is expensive, so this defaults to 1.
+    /// 并行的视频任务数。视频很贵，默认串行。
     pub video_concurrency: usize,
-    /// Hard cap applied to per-shot duration (Veo tops out at 8s).
+    /// 单镜头时长上限（Veo 最长 8 秒）。
     pub max_shot_seconds: u32,
-    /// Seconds between long-running video operation polls.
+    /// 轮询长任务的间隔秒数。
     pub video_poll_secs: u64,
-    /// Give up on a video operation after this many seconds.
+    /// 视频任务多久算超时。
     pub video_timeout_secs: u64,
-    /// Attempts per HTTP call before surfacing the error.
+    /// 每个 HTTP 请求的尝试次数。
     pub request_retries: u32,
 }
 
@@ -411,20 +370,18 @@ impl Default for GenerationSettings {
     }
 }
 
-/// `project.toml`.
+/// `project.toml`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RawConfig")]
 pub struct ProjectConfig {
     pub name: String,
-    /// Style prefix prepended to every image prompt.
+    /// 加在每个图像 prompt 前面的风格前缀。
     pub style: String,
     pub aspect: AspectRatio,
     #[serde(default)]
-    pub routing: Routing,
-    #[serde(default)]
     pub generation: GenerationSettings,
-    /// Per-vendor endpoints and model ids.
-    pub providers: BTreeMap<ProviderId, ProviderSettings>,
+    /// 每种能力一份端点配置。
+    pub endpoints: BTreeMap<Capability, EndpointConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -433,11 +390,10 @@ impl Default for ProjectConfig {
             name: "untitled".into(),
             style: "cinematic, photorealistic, film grain".into(),
             aspect: AspectRatio::Landscape,
-            routing: Routing::default(),
             generation: GenerationSettings::default(),
-            providers: ProviderId::ALL
+            endpoints: Capability::ALL
                 .into_iter()
-                .map(|id| (id, ProviderSettings::defaults_for(id)))
+                .map(|cap| (cap, EndpointConfig::defaults_for(cap)))
                 .collect(),
         }
     }
@@ -453,47 +409,39 @@ impl ProjectConfig {
         }
     }
 
-    pub fn provider(&self, id: ProviderId) -> &ProviderSettings {
-        self.providers
-            .get(&id)
-            .unwrap_or_else(|| panic!("provider {id} missing from config"))
+    pub fn slot(&self, cap: Capability) -> &EndpointConfig {
+        self.endpoints
+            .get(&cap)
+            .unwrap_or_else(|| panic!("capability {cap} missing from config"))
     }
 
-    pub fn provider_mut(&mut self, id: ProviderId) -> &mut ProviderSettings {
-        self.providers
-            .entry(id)
-            .or_insert_with(|| ProviderSettings::defaults_for(id))
+    pub fn slot_mut(&mut self, cap: Capability) -> &mut EndpointConfig {
+        self.endpoints
+            .entry(cap)
+            .or_insert_with(|| EndpointConfig::defaults_for(cap))
     }
 
-    /// Provider assigned to `cap`, together with its resolved endpoint.
+    /// 解析出这次要调用的目标。
     pub fn endpoint(&self, cap: Capability) -> Endpoint {
-        let id = self.routing.get(cap);
-        let settings = self.provider(id);
+        let slot = self.slot(cap);
         Endpoint {
-            provider: id,
+            provider: slot.provider,
             capability: cap,
-            mode: settings.mode,
-            base_url: settings.base_url(id, cap),
-            model: settings.model_for(cap).trim().to_string(),
+            mode: slot.mode,
+            base_url: slot.base_url(),
+            model: slot.model.trim().to_string(),
         }
     }
 
-    /// Fill in any provider entry a hand-edited file left out.
+    /// 补齐手改配置时漏掉的项。
     pub fn normalize(&mut self) {
-        for id in ProviderId::ALL {
-            let defaults = ProviderSettings::defaults_for(id);
-            let entry = self.providers.entry(id).or_insert_with(|| defaults.clone());
-            if entry.chat_model.trim().is_empty() {
-                entry.chat_model = defaults.chat_model;
-            }
-            if entry.image_model.trim().is_empty() {
-                entry.image_model = defaults.image_model;
-            }
-            if entry.video_model.trim().is_empty() {
-                entry.video_model = defaults.video_model;
-            }
-            if entry.custom_base_url.trim().is_empty() {
-                entry.custom_base_url = defaults.custom_base_url;
+        for cap in Capability::ALL {
+            let slot = self
+                .endpoints
+                .entry(cap)
+                .or_insert_with(|| EndpointConfig::defaults_for(cap));
+            if slot.model.trim().is_empty() {
+                slot.model = EndpointConfig::default_model(slot.provider, cap).to_string();
             }
         }
         self.generation.image_concurrency = self.generation.image_concurrency.clamp(1, 16);
@@ -503,19 +451,19 @@ impl ProjectConfig {
         self.generation.request_retries = self.generation.request_retries.clamp(1, 10);
     }
 
-    /// Routing entries pointing at a provider that cannot serve them.
+    /// 指到了不提供该能力的服务商。
     pub fn routing_conflicts(&self) -> Vec<(Capability, ProviderId)> {
         Capability::ALL
             .into_iter()
             .filter_map(|cap| {
-                let id = self.routing.get(cap);
-                (!id.supports(cap)).then_some((cap, id))
+                let provider = self.slot(cap).provider;
+                (!provider.supports(cap)).then_some((cap, provider))
             })
             .collect()
     }
 }
 
-/// A fully resolved call target: who, where, which model.
+/// 一次调用的完整目标：谁、哪里、哪个模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub provider: ProviderId,
@@ -542,11 +490,11 @@ impl fmt::Display for Endpoint {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration
+// 旧格式迁移
 // ---------------------------------------------------------------------------
 
-/// Deserialization target accepting both the current nested layout and the
-/// original flat `<vendor>_*` layout shipped in 0.1.x.
+/// 反序列化目标，同时接受当前格式、0.2.x 的 routing+providers、以及
+/// 0.1.x 的平铺 `<vendor>_*` 字段。
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     #[serde(default = "default_name")]
@@ -555,15 +503,20 @@ pub struct RawConfig {
     style: String,
     #[serde(default)]
     aspect: Option<AspectRatio>,
-
-    #[serde(default)]
-    routing: Option<Routing>,
     #[serde(default)]
     generation: Option<GenerationSettings>,
-    #[serde(default)]
-    providers: Option<BTreeMap<ProviderId, ProviderSettings>>,
 
-    // --- legacy flat fields (0.1.x) ---
+    // --- 当前格式 ---
+    #[serde(default)]
+    endpoints: Option<BTreeMap<Capability, EndpointConfig>>,
+
+    // --- 0.2.x：能力路由 + 按服务商分组 ---
+    #[serde(default)]
+    routing: Option<LegacyRouting>,
+    #[serde(default)]
+    providers: Option<BTreeMap<ProviderId, LegacyProvider>>,
+
+    // --- 0.1.x：平铺字段 ---
     #[serde(default)]
     openai_mode: Option<EndpointMode>,
     #[serde(default)]
@@ -589,17 +542,55 @@ pub struct RawConfig {
     #[serde(default)]
     xai_image_model: Option<String>,
     #[serde(default)]
-    xai_video_model: Option<String>,
-    #[serde(default)]
     xai_custom_base_url: Option<String>,
-    #[serde(default)]
-    xai_video_base_url: Option<String>,
     #[serde(default)]
     chat_provider: Option<ProviderId>,
     #[serde(default)]
     image_provider: Option<ProviderId>,
     #[serde(default)]
     video_provider: Option<ProviderId>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct LegacyRouting {
+    #[serde(default = "openai")]
+    chat: ProviderId,
+    #[serde(default = "openai")]
+    image: ProviderId,
+    #[serde(default = "google")]
+    video: ProviderId,
+}
+
+fn openai() -> ProviderId {
+    ProviderId::OpenAi
+}
+
+fn google() -> ProviderId {
+    ProviderId::Google
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LegacyProvider {
+    #[serde(default)]
+    mode: EndpointMode,
+    #[serde(default)]
+    custom_base_url: String,
+    #[serde(default)]
+    chat_model: String,
+    #[serde(default)]
+    image_model: String,
+    #[serde(default)]
+    video_model: String,
+}
+
+impl LegacyProvider {
+    fn model_for(&self, cap: Capability) -> &str {
+        match cap {
+            Capability::Chat => &self.chat_model,
+            Capability::Image => &self.image_model,
+            Capability::Video => &self.video_model,
+        }
+    }
 }
 
 fn default_name() -> String {
@@ -612,86 +603,108 @@ fn default_style() -> String {
 
 impl From<RawConfig> for ProjectConfig {
     fn from(raw: RawConfig) -> Self {
+        let legacy_flat = legacy_flat_providers(&raw);
         let mut cfg = ProjectConfig {
             name: raw.name,
             style: raw.style,
             aspect: raw.aspect.unwrap_or_default(),
-            routing: raw.routing.unwrap_or_default(),
             generation: raw.generation.unwrap_or_default(),
-            providers: raw.providers.unwrap_or_default(),
+            endpoints: raw.endpoints.unwrap_or_default(),
         };
 
-        // Legacy routing keys win only when the nested table is absent.
-        if raw.routing.is_none() {
-            if let Some(p) = raw.chat_provider {
-                cfg.routing.chat = p;
-            }
-            if let Some(p) = raw.image_provider {
-                cfg.routing.image = p;
-            }
-            if let Some(p) = raw.video_provider {
-                cfg.routing.video = p;
-            }
-        }
+        if cfg.endpoints.is_empty() {
+            // 0.2.x：能力 → 服务商，再从该服务商那组设置里取端点与模型。
+            let routing = raw.routing;
+            let legacy_providers = raw.providers.clone().unwrap_or_default();
 
-        let legacy = [
-            (
-                ProviderId::OpenAi,
-                raw.openai_mode,
-                raw.openai_chat_model,
-                raw.openai_image_model,
-                None,
-                raw.openai_custom_base_url,
-                None,
-            ),
-            (
-                ProviderId::Google,
-                raw.google_mode,
-                raw.google_chat_model,
-                raw.google_image_model,
-                raw.google_video_model,
-                raw.google_custom_base_url,
-                None,
-            ),
-            (
-                ProviderId::Xai,
-                raw.xai_mode,
-                raw.xai_chat_model,
-                raw.xai_image_model,
-                raw.xai_video_model,
-                raw.xai_custom_base_url,
-                raw.xai_video_base_url,
-            ),
-        ];
+            for cap in Capability::ALL {
+                let provider = routing
+                    .map(|r| match cap {
+                        Capability::Chat => r.chat,
+                        Capability::Image => r.image,
+                        Capability::Video => r.video,
+                    })
+                    .or(match cap {
+                        Capability::Chat => raw.chat_provider,
+                        Capability::Image => raw.image_provider,
+                        Capability::Video => raw.video_provider,
+                    })
+                    .unwrap_or(EndpointConfig::defaults_for(cap).provider);
 
-        for (id, mode, chat, image, video, custom_base, video_base) in legacy {
-            let entry = cfg
-                .providers
-                .entry(id)
-                .or_insert_with(|| ProviderSettings::defaults_for(id));
-            if let Some(m) = mode {
-                entry.mode = m;
-            }
-            if let Some(v) = chat.filter(|s| !s.trim().is_empty()) {
-                entry.chat_model = v;
-            }
-            if let Some(v) = image.filter(|s| !s.trim().is_empty()) {
-                entry.image_model = v;
-            }
-            if let Some(v) = video.filter(|s| !s.trim().is_empty()) {
-                entry.video_model = v;
-            }
-            if let Some(v) = custom_base.filter(|s| !s.trim().is_empty()) {
-                entry.custom_base_url = v;
-            }
-            if let Some(v) = video_base.filter(|s| !s.trim().is_empty()) {
-                entry.video_base_url = v;
+                let source = legacy_providers
+                    .get(&provider)
+                    .cloned()
+                    .or_else(|| legacy_flat.get(&provider).cloned());
+
+                let mut slot = EndpointConfig {
+                    provider,
+                    ..EndpointConfig::defaults_for(cap)
+                };
+                if let Some(source) = source {
+                    slot.mode = source.mode;
+                    slot.custom_base_url = source.custom_base_url.clone();
+                    if !source.model_for(cap).trim().is_empty() {
+                        slot.model = source.model_for(cap).to_string();
+                    } else {
+                        slot.model = EndpointConfig::default_model(provider, cap).to_string();
+                    }
+                } else {
+                    slot.model = EndpointConfig::default_model(provider, cap).to_string();
+                }
+                cfg.endpoints.insert(cap, slot);
             }
         }
 
         cfg.normalize();
         cfg
     }
+}
+
+/// 把 0.1.x 的平铺字段收成「按服务商分组」的形状，好和 0.2.x 走同一条路。
+fn legacy_flat_providers(raw: &RawConfig) -> BTreeMap<ProviderId, LegacyProvider> {
+    let mut out = BTreeMap::new();
+    let entries = [
+        (
+            ProviderId::OpenAi,
+            raw.openai_mode,
+            raw.openai_chat_model.clone(),
+            raw.openai_image_model.clone(),
+            None,
+            raw.openai_custom_base_url.clone(),
+        ),
+        (
+            ProviderId::Google,
+            raw.google_mode,
+            raw.google_chat_model.clone(),
+            raw.google_image_model.clone(),
+            raw.google_video_model.clone(),
+            raw.google_custom_base_url.clone(),
+        ),
+        (
+            ProviderId::Xai,
+            raw.xai_mode,
+            raw.xai_chat_model.clone(),
+            raw.xai_image_model.clone(),
+            None,
+            raw.xai_custom_base_url.clone(),
+        ),
+    ];
+    for (id, mode, chat, image, video, base) in entries {
+        if mode.is_none() && chat.is_none() && image.is_none() && video.is_none() && base.is_none() {
+            continue;
+        }
+        out.insert(
+            id,
+            LegacyProvider {
+                mode: mode.unwrap_or_default(),
+                custom_base_url: base.unwrap_or_default(),
+                chat_model: chat.unwrap_or_default(),
+                image_model: image.unwrap_or_default(),
+                video_model: video.unwrap_or_default(),
+            },
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -713,28 +726,83 @@ mod tests {
             video_provider = "google"
         "#;
 
-        let cfg: ProjectConfig = toml::from_str(toml_src).expect("legacy config parses");
+        let cfg: ProjectConfig = toml::from_str(toml_src).expect("0.1.x 配置应能读入");
         assert_eq!(cfg.aspect, AspectRatio::Portrait);
-        assert_eq!(cfg.routing.image, ProviderId::Google);
-        assert_eq!(cfg.routing.video, ProviderId::Google);
-
-        let openai = cfg.provider(ProviderId::OpenAi);
-        assert_eq!(openai.mode, EndpointMode::Custom);
-        assert_eq!(openai.chat_model, "gpt-4.1-mini");
-        // Untouched legacy fields fall back to defaults rather than empty strings.
-        assert_eq!(openai.image_model, "gpt-image-1");
 
         let chat = cfg.endpoint(Capability::Chat);
+        assert_eq!(chat.provider, ProviderId::OpenAi);
         assert_eq!(chat.base_url, "https://proxy.example.com/v1");
         assert_eq!(chat.model, "gpt-4.1-mini");
+
+        let image = cfg.endpoint(Capability::Image);
+        assert_eq!(image.provider, ProviderId::Google);
+        assert_eq!(image.model, "imagen-3.0-generate-002");
+        // 生图走 Google，不该继承 OpenAI 的自定义地址
+        assert!(image.base_url.contains("googleapis.com"));
+    }
+
+    #[test]
+    fn v0_2_routing_config_migrates() {
+        let toml_src = r#"
+            name = "d"
+            style = "s"
+            aspect = "16:9"
+
+            [routing]
+            chat = "openai"
+            image = "openai"
+            video = "google"
+
+            [providers.openai]
+            mode = "custom"
+            custom_base_url = "https://relay.example.com/v1"
+            chat_model = "gpt-4.1"
+            image_model = "gpt-image-1"
+        "#;
+
+        let cfg: ProjectConfig = toml::from_str(toml_src).expect("0.2.x 配置应能读入");
+        // 迁移后两种能力各存一份，之后再改互不影响
+        assert_eq!(cfg.slot(Capability::Chat).custom_base_url, "https://relay.example.com/v1");
+        assert_eq!(cfg.slot(Capability::Image).custom_base_url, "https://relay.example.com/v1");
+        assert_eq!(cfg.endpoint(Capability::Video).provider, ProviderId::Google);
+    }
+
+    #[test]
+    fn capabilities_are_independent() {
+        let mut cfg = ProjectConfig::default();
+        cfg.slot_mut(Capability::Chat).mode = EndpointMode::Custom;
+        cfg.slot_mut(Capability::Chat).custom_base_url = "https://chat-relay/v1".into();
+        cfg.slot_mut(Capability::Chat).model = "gpt-4.1-mini".into();
+
+        // 改对话不应动到生图，即使两者是同一家服务商
+        let image = cfg.endpoint(Capability::Image);
+        assert_eq!(image.provider, ProviderId::OpenAi);
+        assert_eq!(image.mode, EndpointMode::Official);
+        assert_eq!(image.base_url, "https://api.openai.com/v1");
+        assert_eq!(image.model, "gpt-image-1");
+
+        assert_eq!(cfg.endpoint(Capability::Chat).base_url, "https://chat-relay/v1");
+    }
+
+    #[test]
+    fn switching_provider_resets_model_and_url() {
+        let mut cfg = ProjectConfig::default();
+        let slot = cfg.slot_mut(Capability::Image);
+        slot.mode = EndpointMode::Custom;
+        slot.custom_base_url = "https://openai-relay/v1".into();
+
+        slot.switch_provider(ProviderId::Google, Capability::Image);
+        assert_eq!(slot.model, "imagen-3.0-generate-002");
+        // 上一家的中转地址对新家没有意义
+        assert!(slot.custom_base_url.is_empty());
     }
 
     #[test]
     fn round_trips_through_toml() {
         let mut cfg = ProjectConfig::new("demo", "noir", AspectRatio::Portrait);
-        cfg.routing.image = ProviderId::Google;
-        cfg.provider_mut(ProviderId::Google).mode = EndpointMode::Custom;
-        cfg.provider_mut(ProviderId::Google).custom_base_url = "http://localhost:9/v1beta".into();
+        cfg.slot_mut(Capability::Image).provider = ProviderId::Google;
+        cfg.slot_mut(Capability::Image).mode = EndpointMode::Custom;
+        cfg.slot_mut(Capability::Image).custom_base_url = "http://localhost:9/v1beta".into();
 
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         let back: ProjectConfig = toml::from_str(&text).expect("deserialize");
@@ -743,31 +811,26 @@ mod tests {
 
     #[test]
     fn official_mode_ignores_custom_base_url() {
-        let cfg = ProjectConfig::default();
+        let mut cfg = ProjectConfig::default();
+        cfg.slot_mut(Capability::Chat).custom_base_url = "https://ignored/v1".into();
         let ep = cfg.endpoint(Capability::Chat);
         assert_eq!(ep.base_url, "https://api.openai.com/v1");
-        assert_eq!(ep.provider, ProviderId::OpenAi);
     }
 
     #[test]
     fn unsupported_routing_is_detected() {
         let mut cfg = ProjectConfig::default();
-        cfg.routing.video = ProviderId::OpenAi;
-        let conflicts = cfg.routing_conflicts();
-        assert_eq!(conflicts, vec![(Capability::Video, ProviderId::OpenAi)]);
+        cfg.slot_mut(Capability::Video).provider = ProviderId::OpenAi;
+        assert_eq!(
+            cfg.routing_conflicts(),
+            vec![(Capability::Video, ProviderId::OpenAi)]
+        );
     }
 
     #[test]
-    fn video_base_url_override_applies_only_to_video() {
-        let mut cfg = ProjectConfig::default();
-        cfg.routing.video = ProviderId::Xai;
-        cfg.routing.chat = ProviderId::Xai;
-        let xai = cfg.provider_mut(ProviderId::Xai);
-        xai.mode = EndpointMode::Custom;
-        xai.custom_base_url = "https://proxy/v1".into();
-        xai.video_base_url = "https://video-proxy/v1".into();
-
-        assert_eq!(cfg.endpoint(Capability::Video).base_url, "https://video-proxy/v1");
-        assert_eq!(cfg.endpoint(Capability::Chat).base_url, "https://proxy/v1");
+    fn capability_parses_from_cli() {
+        assert_eq!("image".parse::<Capability>().unwrap(), Capability::Image);
+        assert_eq!("视频".parse::<Capability>().unwrap(), Capability::Video);
+        assert!("nope".parse::<Capability>().is_err());
     }
 }

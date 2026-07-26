@@ -10,7 +10,8 @@ pub use breakdown::{
     AssetMeta, Breakdown, Character, Costume, Location, Prop, Shot, StoryboardMeta, VideoMeta,
 };
 pub use config::{
-    AspectRatio, Capability, Endpoint, EndpointMode, GenerationSettings, ProjectConfig, ProviderId,
+    AspectRatio, Capability, Endpoint, EndpointConfig, EndpointMode, GenerationSettings,
+    ProjectConfig, ProviderId,
 };
 pub use index::{ItemView, ProjectIndex};
 pub use project::{AssetKind, Project, ASSET_KINDS};

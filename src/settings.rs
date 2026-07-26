@@ -9,12 +9,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::model::{EndpointMode, ProviderId};
+use crate::model::{Capability, EndpointMode, ProviderId};
 use crate::providers::Credentials;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppSettings {
-    /// `"openai.official"` → key. A map keeps adding providers cheap.
+    /// `"chat.openai.official"` → key。按能力隔离：同一家服务商在对话和生图上
+    /// 可能是两个中转、两把密钥。
     #[serde(default)]
     pub keys: BTreeMap<String, String>,
     #[serde(default)]
@@ -23,7 +24,7 @@ pub struct AppSettings {
     pub recent_projects: Vec<PathBuf>,
     #[serde(default)]
     pub ui: UiPrefs,
-    /// `"openai.official"` → 上次拉取到的模型 ID 列表。
+    /// `"chat.openai.official"` → 上次从该端点拉取到的模型 ID 列表。
     #[serde(default)]
     pub model_cache: BTreeMap<String, Vec<String>>,
 
@@ -119,6 +120,38 @@ impl AppSettings {
     }
 
     fn migrate_legacy(&mut self) {
+        // 0.2.x：密钥按「服务商.模式」存，没有能力维度。复制给三种能力，
+        // 之后各自独立。
+        let shared: Vec<(String, String)> = self
+            .keys
+            .iter()
+            .filter(|(k, _)| k.split('.').count() == 2)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (old_key, value) in shared {
+            for cap in Capability::ALL {
+                self.keys
+                    .entry(format!("{}.{old_key}", cap.as_str()))
+                    .or_insert_with(|| value.clone());
+            }
+            self.keys.remove(&old_key);
+        }
+        let stale: Vec<String> = self
+            .model_cache
+            .keys()
+            .filter(|k| k.split('.').count() == 2)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(models) = self.model_cache.remove(&key) {
+                for cap in Capability::ALL {
+                    self.model_cache
+                        .entry(format!("{}.{key}", cap.as_str()))
+                        .or_insert_with(|| models.clone());
+                }
+            }
+        }
+
         let legacy = [
             (ProviderId::OpenAi, EndpointMode::Official, std::mem::take(&mut self.openai_official_key)),
             (ProviderId::OpenAi, EndpointMode::Official, std::mem::take(&mut self.openai_api_key_legacy)),
@@ -134,7 +167,11 @@ impl AppSettings {
             if value.trim().is_empty() {
                 continue;
             }
-            self.keys.entry(slot(id, mode)).or_insert(value);
+            for cap in Capability::ALL {
+                self.keys
+                    .entry(slot(cap, id, mode))
+                    .or_insert_with(|| value.clone());
+            }
         }
     }
 
@@ -150,44 +187,62 @@ impl AppSettings {
         Ok(())
     }
 
-    pub fn key(&self, id: ProviderId, mode: EndpointMode) -> &str {
-        self.keys.get(&slot(id, mode)).map(|s| s.as_str()).unwrap_or("")
+    pub fn key(&self, cap: Capability, id: ProviderId, mode: EndpointMode) -> &str {
+        self.keys
+            .get(&slot(cap, id, mode))
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
-    pub fn set_key(&mut self, id: ProviderId, mode: EndpointMode, value: impl Into<String>) {
+    pub fn set_key(
+        &mut self,
+        cap: Capability,
+        id: ProviderId,
+        mode: EndpointMode,
+        value: impl Into<String>,
+    ) {
         let value = value.into();
         if value.trim().is_empty() {
-            self.keys.remove(&slot(id, mode));
+            self.keys.remove(&slot(cap, id, mode));
         } else {
-            self.keys.insert(slot(id, mode), value.trim().to_string());
+            self.keys
+                .insert(slot(cap, id, mode), value.trim().to_string());
         }
     }
 
     /// Credentials for a job: stored keys, with environment variables filling
     /// any gaps (so `OPENAI_API_KEY=… adrama parse` still works).
     /// Model ids last fetched from this endpoint.
-    pub fn known_models(&self, id: ProviderId, mode: EndpointMode) -> &[String] {
+    pub fn known_models(&self, cap: Capability, id: ProviderId, mode: EndpointMode) -> &[String] {
         self.model_cache
-            .get(&slot(id, mode))
+            .get(&slot(cap, id, mode))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
-    pub fn set_known_models(&mut self, id: ProviderId, mode: EndpointMode, models: Vec<String>) {
+    pub fn set_known_models(
+        &mut self,
+        cap: Capability,
+        id: ProviderId,
+        mode: EndpointMode,
+        models: Vec<String>,
+    ) {
         if models.is_empty() {
-            self.model_cache.remove(&slot(id, mode));
+            self.model_cache.remove(&slot(cap, id, mode));
         } else {
-            self.model_cache.insert(slot(id, mode), models);
+            self.model_cache.insert(slot(cap, id, mode), models);
         }
     }
 
     pub fn credentials(&self) -> Credentials {
         let mut creds = Credentials::default();
-        for id in ProviderId::ALL {
-            for mode in EndpointMode::ALL {
-                let value = self.key(id, mode);
-                if !value.is_empty() {
-                    creds.set(id, mode, value);
+        for cap in Capability::ALL {
+            for id in ProviderId::ALL {
+                for mode in EndpointMode::ALL {
+                    let value = self.key(cap, id, mode);
+                    if !value.is_empty() {
+                        creds.set(cap, id, mode, value);
+                    }
                 }
             }
         }
@@ -229,9 +284,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn slot(id: ProviderId, mode: EndpointMode) -> String {
+fn slot(cap: Capability, id: ProviderId, mode: EndpointMode) -> String {
     format!(
-        "{}.{}",
+        "{}.{}.{}",
+        cap.as_str(),
         id.as_str(),
         match mode {
             EndpointMode::Official => "official",
@@ -263,25 +319,56 @@ mod tests {
         let mut settings: AppSettings = serde_json::from_str(json).unwrap();
         settings.migrate_legacy();
 
-        assert_eq!(settings.key(ProviderId::OpenAi, EndpointMode::Official), "sk-old");
-        assert_eq!(settings.key(ProviderId::Google, EndpointMode::Custom), "proxy-key");
+        // 0.1.x 的单把密钥会复制给三种能力，之后各自独立
+        for cap in Capability::ALL {
+            assert_eq!(settings.key(cap, ProviderId::OpenAi, EndpointMode::Official), "sk-old");
+            assert_eq!(settings.key(cap, ProviderId::Google, EndpointMode::Custom), "proxy-key");
+        }
         assert_eq!(settings.recent_projects.len(), 1);
 
         // Re-serializing drops the legacy fields.
         let text = serde_json::to_string(&settings).unwrap();
         assert!(!text.contains("openai_api_key"));
-        assert!(text.contains("openai.official"));
+        assert!(text.contains("chat.openai.official"));
     }
 
     #[test]
     fn official_and_custom_keys_are_independent() {
         let mut s = AppSettings::default();
-        s.set_key(ProviderId::OpenAi, EndpointMode::Official, "a");
-        s.set_key(ProviderId::OpenAi, EndpointMode::Custom, "b");
-        assert_eq!(s.key(ProviderId::OpenAi, EndpointMode::Official), "a");
-        assert_eq!(s.key(ProviderId::OpenAi, EndpointMode::Custom), "b");
-        s.set_key(ProviderId::OpenAi, EndpointMode::Custom, "");
-        assert_eq!(s.key(ProviderId::OpenAi, EndpointMode::Custom), "");
+        let cap = Capability::Chat;
+        s.set_key(cap, ProviderId::OpenAi, EndpointMode::Official, "a");
+        s.set_key(cap, ProviderId::OpenAi, EndpointMode::Custom, "b");
+        assert_eq!(s.key(cap, ProviderId::OpenAi, EndpointMode::Official), "a");
+        assert_eq!(s.key(cap, ProviderId::OpenAi, EndpointMode::Custom), "b");
+        s.set_key(cap, ProviderId::OpenAi, EndpointMode::Custom, "");
+        assert_eq!(s.key(cap, ProviderId::OpenAi, EndpointMode::Custom), "");
+    }
+
+    #[test]
+    fn capabilities_do_not_share_keys() {
+        let mut s = AppSettings::default();
+        s.set_key(Capability::Chat, ProviderId::OpenAi, EndpointMode::Custom, "chat-relay-key");
+        // 同一家、同一模式，但生图那格仍然是空的
+        assert_eq!(
+            s.key(Capability::Image, ProviderId::OpenAi, EndpointMode::Custom),
+            ""
+        );
+        s.set_key(Capability::Image, ProviderId::OpenAi, EndpointMode::Custom, "image-relay-key");
+        assert_eq!(
+            s.key(Capability::Chat, ProviderId::OpenAi, EndpointMode::Custom),
+            "chat-relay-key"
+        );
+    }
+
+    #[test]
+    fn v0_2_keys_migrate_to_every_capability() {
+        let json = r#"{ "keys": { "openai.official": "sk-shared" } }"#;
+        let mut settings: AppSettings = serde_json::from_str(json).unwrap();
+        settings.migrate_legacy();
+        for cap in Capability::ALL {
+            assert_eq!(settings.key(cap, ProviderId::OpenAi, EndpointMode::Official), "sk-shared");
+        }
+        assert!(!settings.keys.contains_key("openai.official"));
     }
 
     #[test]

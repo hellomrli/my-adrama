@@ -47,7 +47,7 @@ Linux 需要一款中文字体（`sudo apt install fonts-noto-cjk`），否则�
 | **流程图** | 拆解之后自动画出这个项目的**真实依赖图**：哪些资产会被哪个分镜当参考、哪个分镜生成哪个片段、最后拼成成片。节点颜色即状态，点节点直接跳到对应条目 |
 | **拆解** | 结构化查看角色表与按场次分组的镜头表（景别、时长、台词），可切原始 JSON |
 | **资产 / 分镜 / 视频** | 条目工作台：网格列出**全部应生成项**（含尚未生成的），右侧检查器可看大图、改 prompt、单条重生成；工具栏有「生成缺失 / 全部重生成 / 重试失败 / 审核通过」 |
-| **设置** | **按能力配置**：对话模型 / 生图模型 / 视频模型各一张卡——选供应商 → 官方或自定义地址 → 密钥 → 从拉取到的模型里选。另有项目参数与在线更新 |
+| **设置** | **按能力配置且互相独立**：对话模型 / 生图模型 / 视频模型各一张卡——选供应商 → 官方或自定义地址 → 密钥 → 从拉取到的模型里选。三格的服务商、地址、密钥、模型都分开存 |
 
 - 顶栏 **演练模式**：只组装并展示 prompt，不调用任何付费接口。
 - 底部**控制台**：实时进度、逐条状态与失败原因；任务运行中随时可取消（视频轮询中也能立刻停）。
@@ -93,8 +93,8 @@ adrama status
 | `adrama export` | 拼接成片 |
 | `adrama status` | 项目状态与各阶段完成度 |
 | `adrama providers` | 查看能力路由与密钥配置情况 |
-| `adrama test <provider>` | 测试连通性（`--mode official\|custom`） |
-| `adrama models <provider>` | 列出该服务商当前提供的模型（`--capability chat\|image\|video` 可筛选） |
+| `adrama test <capability>` | 测试该能力所配端点（`chat` / `image` / `video`） |
+| `adrama models <capability>` | 列出该能力所配端点提供的模型（`--all` 看全部） |
 | `adrama update [--apply]` | 检查新版本；加 `--apply` 直接下载安装 |
 | `adrama approve <stage>` / `reset <stage>` | 审核通过 / 撤销审核 |
 
@@ -125,8 +125,9 @@ adrama status
 | Google | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `ADRAMA_GOOGLE_CUSTOM_KEY` |
 | xAI | `XAI_API_KEY` / `GROK_API_KEY` | `ADRAMA_XAI_CUSTOM_KEY` |
 
-设置页按能力组织：一张卡回答「这件事找谁做、连哪里、用什么密钥、跑哪个模型」。
-注意端点与密钥属于**服务商**，两种能力选了同一家时是共用的，界面会明确提示。
+设置页按能力组织，且**三格完全独立**：一张卡回答「这件事找谁做、连哪里、用什么密钥、跑哪个模型」。
+即使对话和生图都选 OpenAI，也可以一个走官方、一个走你自己的中转，密钥与模型列表各存一份——
+改一处不会动到另一处。同一个端点在别处填过密钥时，会出现「沿用…的密钥」按钮做一次性复制。
 
 **模型不写死**：点「测试并拉取模型」会调用上游的 `/models`，把当前真实可用的模型列进下拉框
 （相关的排在前面，其余的也都列出来），选中即写入 `project.toml`；列表会缓存下来，重启仍在。
@@ -174,11 +175,6 @@ name = "my-drama"
 style = "cinematic, photorealistic, film grain"
 aspect = "16:9"
 
-[routing]
-chat = "openai"
-image = "openai"
-video = "google"
-
 [generation]
 image_concurrency = 3     # 图像并发
 video_concurrency = 1     # 视频串行，避免成本失控
@@ -187,22 +183,39 @@ video_poll_secs = 10
 video_timeout_secs = 1800
 request_retries = 3
 
-[providers.openai]
-mode = "official"         # official | custom
-chat_model = "gpt-4.1"
-image_model = "gpt-image-1"
+# 三种能力各自一段，互不影响
+[endpoints.chat]
+provider = "openai"
+mode = "official"          # official | custom
+model = "gpt-4.1"
 
-[providers.google]
+[endpoints.image]
+provider = "openai"
+mode = "custom"            # 同一家，但走自己的中转
+custom_base_url = "https://image-relay.example.com/v1"
+model = "gpt-image-1"
+
+[endpoints.video]
+provider = "google"
 mode = "official"
-chat_model = "gemini-2.0-flash"
-image_model = "imagen-3.0-generate-002"
-video_model = "veo-3.1-generate-preview"
+model = "veo-3.1-generate-preview"
 ```
 
-0.1.x 的旧 `project.toml`（平铺的 `openai_chat_model` 等字段）打开时自动迁移，
-老项目可以直接继续用。
+0.1.x / 0.2.x 的旧 `project.toml`（平铺字段，或 `routing` + `providers`）
+打开时自动迁移成上面的格式，老项目直接继续用；本机保存的密钥同样会自动拆到三种能力下。
 
 ---
+
+## 0.3.0 有什么变化
+
+- **对话 / 生图 / 视频三种能力彻底独立**。以前服务商、端点地址和密钥是按「服务商」存的，
+  两种能力选了同一家就会共用，改一处影响另一处。现在每种能力自己存一份
+  服务商 + 地址 + 密钥 + 模型，互不干扰——同是 OpenAI，对话走官方、生图走你的中转，
+  这是常见需求。
+- `project.toml` 改为 `[endpoints.chat|image|video]` 三段；旧格式（0.1.x 平铺字段、
+  0.2.x 的 `routing` + `providers`）打开时自动迁移，本机密钥也会自动拆到三种能力下。
+- 缺密钥的报错会点名是哪种能力，而不是笼统地说某家服务商。
+- CLI：`adrama test <chat|image|video>`、`adrama models <chat|image|video> [--all]`。
 
 ## 0.2.3 有什么变化
 

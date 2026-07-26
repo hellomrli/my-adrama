@@ -28,34 +28,37 @@ ui/  (egui 桌面端)        cli.rs (命令行)
 
 ## 关键设计
 
-### 1. 能力路由靠 trait，而不是 if
+### 1. 能力是配置的第一维度
 
-项目配置里只声明「哪种能力交给哪家服务商」：
+项目配置里，三种能力各自声明「谁来做、连哪里、用哪个模型」：
 
 ```toml
-[routing]
-chat = "openai"      # 剧本拆解
-image = "openai"     # 资产图 / 分镜图
-video = "google"     # 图生视频
+[endpoints.chat]
+provider = "openai"
+mode = "official"
+model = "gpt-4.1"
+
+[endpoints.image]
+provider = "openai"      # 同一家……
+mode = "custom"          # ……但走自己的中转，与对话互不影响
+custom_base_url = "https://image-relay.example.com/v1"
+model = "gpt-image-1"
 ```
+
+**不共享**是刻意的。早期版本把端点和密钥按服务商存，两种能力选同一家就会共用，
+用户改对话的中转地址、生图跟着变——这是个真实踩到的坑。密钥同样按
+「能力 + 服务商 + 模式」存放，界面提供一次性复制按钮，而不是隐式共享。
 
 `ProviderFactory` 按能力构造对应客户端，并在构造时就拒绝不可能的组合
 （例如把「视频」路由到只有对话/图像能力的服务商），而不是发出一个形状错误的
 HTTP 请求再让用户去猜 400 的含义。新增服务商 = 实现 trait + 在 `ProviderId`
 增加一个分支，不需要改阶段代码。
 
-### 2. 配置是一张表，不是一堆平铺字段
+### 2. 旧配置一律自动迁移
 
-```toml
-[providers.openai]
-mode = "official"          # official | custom（代理/自建）
-chat_model  = "gpt-4.1"
-image_model = "gpt-image-1"
-custom_base_url = "..."
-```
-
-`providers` 是 `ProviderId → ProviderSettings` 的映射。0.1.x 的平铺字段
-（`openai_chat_model` 等）在读取时自动迁移，老项目直接能开。
+`RawConfig` 同时接受三种形态：当前的 `[endpoints.*]`、0.2.x 的
+`routing` + `providers`、以及 0.1.x 的平铺 `openai_chat_model` 字段，
+统一转换成按能力分组的结构。用户升级时不需要手工改任何文件。
 
 ### 3. 密钥是值，不是进程环境
 

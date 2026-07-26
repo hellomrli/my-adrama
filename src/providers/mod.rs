@@ -92,7 +92,9 @@ pub trait VideoProvider: Send + Sync {
 /// scope per job. Keys now travel as values.
 #[derive(Clone, Default)]
 pub struct Credentials {
-    entries: BTreeMap<(ProviderId, EndpointMode), String>,
+    /// 按「能力 + 服务商 + 端点模式」存放：对话和生图即使是同一家，
+    /// 也可能用不同中转、不同额度的密钥。
+    entries: BTreeMap<(Capability, ProviderId, EndpointMode), String>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -104,32 +106,42 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    pub fn set(&mut self, id: ProviderId, mode: EndpointMode, key: impl Into<String>) {
+    pub fn set(
+        &mut self,
+        cap: Capability,
+        id: ProviderId,
+        mode: EndpointMode,
+        key: impl Into<String>,
+    ) {
         let key = key.into().trim().to_string();
         if key.is_empty() {
-            self.entries.remove(&(id, mode));
+            self.entries.remove(&(cap, id, mode));
         } else {
-            self.entries.insert((id, mode), key);
+            self.entries.insert((cap, id, mode), key);
         }
     }
 
-    pub fn get(&self, id: ProviderId, mode: EndpointMode) -> Option<&str> {
-        self.entries.get(&(id, mode)).map(|s| s.as_str())
+    pub fn get(&self, cap: Capability, id: ProviderId, mode: EndpointMode) -> Option<&str> {
+        self.entries.get(&(cap, id, mode)).map(|s| s.as_str())
     }
 
-    pub fn has(&self, id: ProviderId, mode: EndpointMode) -> bool {
-        self.get(id, mode).is_some()
+    pub fn has(&self, cap: Capability, id: ProviderId, mode: EndpointMode) -> bool {
+        self.get(cap, id, mode).is_some()
     }
 
-    /// Read keys from the environment (including anything `.env` loaded).
+    /// 环境变量是按服务商给的，对三种能力都适用。
     pub fn from_env() -> Self {
         let mut creds = Self::default();
         for id in ProviderId::ALL {
-            if let Some(k) = first_env(id.official_env_keys()) {
-                creds.set(id, EndpointMode::Official, k);
-            }
-            if let Some(k) = first_env(id.custom_env_keys()) {
-                creds.set(id, EndpointMode::Custom, k);
+            let official = first_env(id.official_env_keys());
+            let custom = first_env(id.custom_env_keys());
+            for cap in Capability::ALL {
+                if let Some(k) = &official {
+                    creds.set(cap, id, EndpointMode::Official, k.clone());
+                }
+                if let Some(k) = &custom {
+                    creds.set(cap, id, EndpointMode::Custom, k.clone());
+                }
             }
         }
         creds
@@ -143,13 +155,14 @@ impl Credentials {
         }
     }
 
-    pub fn require(&self, id: ProviderId, mode: EndpointMode) -> Result<&str> {
-        self.get(id, mode).with_context(|| {
+    pub fn require(&self, cap: Capability, id: ProviderId, mode: EndpointMode) -> Result<&str> {
+        self.get(cap, id, mode).with_context(|| {
             format!(
-                "未设置 {} 的{}密钥（设置 → 服务商 → {}）",
+                "「{}」还没有配置 {} 的{}密钥（设置 → 模型与密钥 → {}）",
+                cap.label(),
                 id.label(),
                 mode.label(),
-                id.label()
+                cap.label()
             )
         })
     }
@@ -207,7 +220,7 @@ impl<'a> ProviderFactory<'a> {
         }
         let key = self
             .credentials
-            .require(endpoint.provider, endpoint.mode)?
+            .require(cap, endpoint.provider, endpoint.mode)?
             .to_string();
         Ok((endpoint, key))
     }
@@ -336,26 +349,22 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::config::Routing;
+    use crate::model::Capability;
 
     fn creds_with_all() -> Credentials {
         let mut c = Credentials::default();
-        for id in ProviderId::ALL {
-            c.set(id, EndpointMode::Official, format!("key-for-{id}"));
+        for cap in Capability::ALL {
+            for id in ProviderId::ALL {
+                c.set(cap, id, EndpointMode::Official, format!("key-{cap}-{id}"));
+            }
         }
         c
     }
 
     #[test]
     fn unsupported_capability_is_rejected_before_any_request() {
-        let config = ProjectConfig {
-            routing: Routing {
-                chat: ProviderId::OpenAi,
-                image: ProviderId::OpenAi,
-                video: ProviderId::Xai,
-            },
-            ..ProjectConfig::default()
-        };
+        let mut config = ProjectConfig::default();
+        config.slot_mut(Capability::Video).provider = ProviderId::Xai;
         let creds = creds_with_all();
         let err = ProviderFactory::new(&config, &creds)
             .video()
@@ -365,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_names_the_provider_and_mode() {
+    fn missing_key_names_the_capability_and_mode() {
         let config = ProjectConfig::default();
         let creds = Credentials::default();
         let err = ProviderFactory::new(&config, &creds)
@@ -373,14 +382,15 @@ mod tests {
             .err()
             .expect("no key configured");
         let msg = err.to_string();
+        assert!(msg.contains("对话"), "{msg}");
         assert!(msg.contains("OpenAI"), "{msg}");
         assert!(msg.contains("官方"), "{msg}");
     }
 
     #[test]
-    fn routing_selects_the_matching_client() {
+    fn each_capability_resolves_its_own_endpoint() {
         let mut config = ProjectConfig::default();
-        config.routing.image = ProviderId::Google;
+        config.slot_mut(Capability::Image).provider = ProviderId::Google;
         let creds = creds_with_all();
         let factory = ProviderFactory::new(&config, &creds);
 
@@ -391,18 +401,44 @@ mod tests {
             .base_url
             .starts_with("https://generativelanguage.googleapis.com"));
 
+        // 改生图不影响对话
         let chat = factory.chat().unwrap();
         assert_eq!(chat.endpoint().provider, ProviderId::OpenAi);
+        assert_eq!(chat.endpoint().base_url, "https://api.openai.com/v1");
     }
 
     #[test]
     fn credentials_keep_official_and_custom_apart() {
+        let cap = Capability::Chat;
         let mut c = Credentials::default();
-        c.set(ProviderId::OpenAi, EndpointMode::Official, "official");
-        c.set(ProviderId::OpenAi, EndpointMode::Custom, "custom");
-        assert_eq!(c.get(ProviderId::OpenAi, EndpointMode::Official), Some("official"));
-        assert_eq!(c.get(ProviderId::OpenAi, EndpointMode::Custom), Some("custom"));
-        c.set(ProviderId::OpenAi, EndpointMode::Custom, "   ");
-        assert!(!c.has(ProviderId::OpenAi, EndpointMode::Custom));
+        c.set(cap, ProviderId::OpenAi, EndpointMode::Official, "official");
+        c.set(cap, ProviderId::OpenAi, EndpointMode::Custom, "custom");
+        assert_eq!(
+            c.get(cap, ProviderId::OpenAi, EndpointMode::Official),
+            Some("official")
+        );
+        assert_eq!(
+            c.get(cap, ProviderId::OpenAi, EndpointMode::Custom),
+            Some("custom")
+        );
+        c.set(cap, ProviderId::OpenAi, EndpointMode::Custom, "   ");
+        assert!(!c.has(cap, ProviderId::OpenAi, EndpointMode::Custom));
+    }
+
+    #[test]
+    fn capabilities_do_not_share_credentials() {
+        let config = ProjectConfig::default();
+        let mut creds = Credentials::default();
+        creds.set(Capability::Chat, ProviderId::OpenAi, EndpointMode::Official, "k");
+        let factory = ProviderFactory::new(&config, &creds);
+
+        assert!(factory.chat().is_ok());
+        // 同一家、同一模式，但生图那格没填就是没填
+        let err = factory
+            .image()
+            .err()
+            .expect("image key missing")
+            .to_string();
+        assert!(err.contains("图像"), "{err}");
     }
 }

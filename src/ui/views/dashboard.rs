@@ -220,7 +220,7 @@ fn readiness(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     for cap in Capability::ALL {
         let endpoint = snapshot.config.endpoint(cap);
         let supported = endpoint.provider.supports(cap);
-        let has_key = credentials.has(endpoint.provider, endpoint.mode);
+        let has_key = credentials.has(cap, endpoint.provider, endpoint.mode);
         rows.push((
             supported && has_key,
             format!(

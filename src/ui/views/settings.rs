@@ -52,47 +52,58 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
 }
 
 // ---------------------------------------------------------------------------
-// 模型与密钥：一种能力一张卡
+// 模型与密钥：一种能力一张卡，彼此完全独立
 // ---------------------------------------------------------------------------
 
 fn capabilities(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     widgets::hint(
         ui,
-        "先选这项能力交给谁，再填该服务商的地址与密钥，最后从拉取到的模型里挑一个。",
+        "三种能力各自独立：服务商、地址、密钥、模型都分开存，改一处不会动到另一处。",
     );
     ui.add_space(theme::SPACE_SM);
 
-    let mut probe: Option<(ProviderId, EndpointMode)> = None;
+    let mut probe: Option<Capability> = None;
+    let mut copy_from: Option<(Capability, Capability)> = None;
+
     for cap in Capability::ALL {
-        if let Some(request) = capability_card(ui, cx, cap) {
-            probe = Some(request);
+        let action = capability_card(ui, cx, cap);
+        if action.probe {
+            probe = Some(cap);
+        }
+        if let Some(source) = action.copy_key_from {
+            copy_from = Some((source, cap));
         }
         ui.add_space(theme::SPACE_SM);
     }
 
-    key_overview(ui, cx);
-    ui.add_space(theme::SPACE_SM);
     save_bar(ui, cx);
 
-    if let Some((id, mode)) = probe {
-        launch_probe(cx, id, mode);
+    if let Some((from, to)) = copy_from {
+        copy_key(cx, from, to);
+    }
+    if let Some(cap) = probe {
+        launch_probe(cx, cap);
     }
 }
 
-/// 返回值：本帧是否请求了「测试并拉取模型」。
-fn capability_card(
-    ui: &mut Ui,
-    cx: &mut ViewCtx<'_>,
-    cap: Capability,
-) -> Option<(ProviderId, EndpointMode)> {
+#[derive(Default)]
+struct CardAction {
+    probe: bool,
+    /// 从哪种能力把密钥抄过来（一次性复制，不是共享）。
+    copy_key_from: Option<Capability>,
+}
+
+fn capability_card(ui: &mut Ui, cx: &mut ViewCtx<'_>, cap: Capability) -> CardAction {
     let busy = cx.state.is_busy();
-    let provider = cx.state.config_draft.routing.get(cap);
-    let mode = cx.state.config_draft.provider(provider).mode;
-    let shared_with = shared_capabilities(cx, cap, provider);
-    let mut probe = None;
+    let slot = cx.state.config_draft.slot(cap).clone();
+    let has_key = !cx
+        .state
+        .settings
+        .key(cap, slot.provider, slot.mode)
+        .is_empty();
+    let mut action = CardAction::default();
 
     theme::card().show(ui, |ui| {
-        // 标题
         ui.horizontal(|ui| {
             widgets::dot(ui, capability_color(cap), 10.0);
             ui.label(RichText::new(capability_title(cap)).size(15.0).strong());
@@ -102,14 +113,7 @@ fn capability_card(
                     .color(theme::TEXT_MUTED),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ready = cx.state.credentials().has(provider, mode)
-                    && !cx
-                        .state
-                        .config_draft
-                        .provider(provider)
-                        .model_for(cap)
-                        .trim()
-                        .is_empty();
+                let ready = has_key && !slot.model.trim().is_empty();
                 widgets::pill(
                     ui,
                     if ready { "可用" } else { "未配置完整" },
@@ -118,12 +122,12 @@ fn capability_card(
             });
         });
 
-        // 1. 供应商
+        // 1. 服务商
         ui.add_space(theme::SPACE_SM);
-        widgets::field_row(ui, "供应商", LABEL_W, |ui| {
+        widgets::field_row(ui, "服务商", LABEL_W, |ui| {
             for id in ProviderId::ALL {
                 let supported = id.supports(cap);
-                let selected = cx.state.config_draft.routing.get(cap) == id;
+                let selected = slot.provider == id;
                 let text = RichText::new(id.label()).color(if supported {
                     theme::TEXT
                 } else {
@@ -133,8 +137,8 @@ fn capability_card(
                     .add_enabled(supported, egui::SelectableLabel::new(selected, text))
                     .on_hover_text(id.tagline())
                     .on_disabled_hover_text(format!("{} 不提供{}能力", id.label(), cap.label()));
-                if response.clicked() {
-                    cx.state.config_draft.routing.set(cap, id);
+                if response.clicked() && !selected {
+                    cx.state.config_draft.slot_mut(cap).switch_provider(id, cap);
                     cx.state.config_dirty = true;
                 }
             }
@@ -142,30 +146,27 @@ fn capability_card(
 
         // 2. 端点
         widgets::field_row(ui, "端点", LABEL_W, |ui| {
-            let settings = cx.state.config_draft.provider_mut(provider);
+            let entry = cx.state.config_draft.slot_mut(cap);
             for m in EndpointMode::ALL {
-                if ui
-                    .selectable_value(&mut settings.mode, m, m.label())
-                    .changed()
-                {
+                if ui.selectable_value(&mut entry.mode, m, m.label()).changed() {
                     cx.state.config_dirty = true;
                 }
             }
-            if mode == EndpointMode::Official {
+            if slot.mode == EndpointMode::Official {
                 ui.label(
-                    RichText::new(provider.official_base_url())
+                    RichText::new(slot.provider.official_base_url())
                         .small()
                         .monospace()
                         .color(theme::TEXT_DIM),
                 );
             }
         });
-        if mode == EndpointMode::Custom {
+        if slot.mode == EndpointMode::Custom {
             widgets::field_row(ui, "地址", LABEL_W, |ui| {
-                let settings = cx.state.config_draft.provider_mut(provider);
+                let entry = cx.state.config_draft.slot_mut(cap);
                 if widgets::text_field(
                     ui,
-                    &mut settings.custom_base_url,
+                    &mut entry.custom_base_url,
                     320.0,
                     "https://proxy.example.com/v1",
                 ) {
@@ -174,74 +175,125 @@ fn capability_card(
             });
         }
 
-        // 3. 密钥（含测试）
+        // 3. 密钥
         widgets::field_row(ui, "密钥", LABEL_W, |ui| {
-            let mut key = cx.state.settings.key(provider, mode).to_string();
-            let reveal_key = format!("{provider}.{}", mode.label());
+            let mut key = cx
+                .state
+                .settings
+                .key(cap, slot.provider, slot.mode)
+                .to_string();
+            let reveal_key = format!("{cap}.{}.{}", slot.provider, slot.mode.label());
             let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
-            if widgets::secret_field(ui, &mut key, &mut revealed, 300.0, key_hint(provider)) {
-                cx.state.settings.set_key(provider, mode, key.clone());
+            if widgets::secret_field(ui, &mut key, &mut revealed, 300.0, key_hint(slot.provider)) {
+                cx.state
+                    .settings
+                    .set_key(cap, slot.provider, slot.mode, key.clone());
                 cx.state.keys_dirty = true;
             }
             cx.state.revealed.insert(reveal_key, revealed);
 
-            let url_ready = mode == EndpointMode::Official
-                || !cx
-                    .state
-                    .config_draft
-                    .provider(provider)
-                    .custom_base_url
-                    .trim()
-                    .is_empty();
+            let url_ready =
+                slot.mode == EndpointMode::Official || !slot.custom_base_url.trim().is_empty();
             if ui
                 .add_enabled(
                     !busy && !key.trim().is_empty() && url_ready,
                     egui::Button::new("测试并拉取模型"),
                 )
-                .on_hover_text("验证密钥是否可用，并把该服务商当前提供的模型拉下来")
+                .on_hover_text("验证这一格的密钥，并拉取该端点当前提供的模型")
                 .clicked()
             {
-                probe = Some((provider, mode));
+                action.probe = true;
             }
         });
 
-        // 4. 模型
-        model_row(ui, cx, cap, provider, mode);
-
-        if !shared_with.is_empty() {
-            ui.add_space(theme::SPACE_XS);
-            widgets::hint(
-                ui,
-                &format!(
-                    "端点与密钥与「{}」共用（都走 {}），改这里也会影响那边。",
-                    shared_with.join("、"),
-                    provider.label()
-                ),
-            );
+        // 同一个端点在别处填过密钥时，给一个一次性复制的入口（不是共享）
+        if !has_key {
+            if let Some(source) = donor_capability(cx, cap, &slot) {
+                widgets::field_row(ui, "", LABEL_W, |ui| {
+                    if ui
+                        .small_button(format!("沿用「{}」的密钥", capability_title(source)))
+                        .on_hover_text("复制一份过来，之后两边各自独立，改一边不影响另一边")
+                        .clicked()
+                    {
+                        action.copy_key_from = Some(source);
+                    }
+                });
+            }
         }
+
+        // 4. 模型
+        model_row(ui, cx, cap, &slot);
     });
 
-    probe
+    action
 }
 
-fn model_row(
-    ui: &mut Ui,
-    cx: &mut ViewCtx<'_>,
+/// 哪种能力用着同样的服务商+端点模式且已经填了密钥。
+fn donor_capability(
+    cx: &ViewCtx<'_>,
     cap: Capability,
-    provider: ProviderId,
-    mode: EndpointMode,
-) {
-    let known: Vec<String> = cx.state.settings.known_models(provider, mode).to_vec();
-    let current = cx
+    slot: &crate::model::EndpointConfig,
+) -> Option<Capability> {
+    Capability::ALL.into_iter().find(|other| {
+        if *other == cap {
+            return false;
+        }
+        let theirs = cx.state.config_draft.slot(*other);
+        theirs.provider == slot.provider
+            && theirs.mode == slot.mode
+            && theirs.custom_base_url.trim() == slot.custom_base_url.trim()
+            && !cx
+                .state
+                .settings
+                .key(*other, theirs.provider, theirs.mode)
+                .is_empty()
+    })
+}
+
+fn copy_key(cx: &mut ViewCtx<'_>, from: Capability, to: Capability) {
+    let source = cx.state.config_draft.slot(from).clone();
+    let key = cx
         .state
-        .config_draft
-        .provider(provider)
-        .model_for(cap)
+        .settings
+        .key(from, source.provider, source.mode)
         .to_string();
+    if key.is_empty() {
+        return;
+    }
+    let target = cx.state.config_draft.slot(to).clone();
+    cx.state
+        .settings
+        .set_key(to, target.provider, target.mode, key);
+    // 模型列表也一并带过来，省一次探测。
+    let models = cx
+        .state
+        .settings
+        .known_models(from, source.provider, source.mode)
+        .to_vec();
+    if !models.is_empty() {
+        cx.state
+            .settings
+            .set_known_models(to, target.provider, target.mode, models);
+    }
+    cx.state.keys_dirty = true;
+    cx.state.note(format!(
+        "已把「{}」的密钥复制到「{}」，两者之后互不影响",
+        capability_title(from),
+        capability_title(to)
+    ));
+}
+
+fn model_row(ui: &mut Ui, cx: &mut ViewCtx<'_>, cap: Capability, slot: &crate::model::EndpointConfig) {
+    let known: Vec<String> = cx
+        .state
+        .settings
+        .known_models(cap, slot.provider, slot.mode)
+        .to_vec();
+    let current = slot.model.clone();
 
     widgets::field_row(ui, "模型", LABEL_W, |ui| {
-        let settings = cx.state.config_draft.provider_mut(provider);
-        if widgets::text_field(ui, settings.model_for_mut(cap), 240.0, "模型 ID") {
+        let entry = cx.state.config_draft.slot_mut(cap);
+        if widgets::text_field(ui, &mut entry.model, 240.0, "模型 ID") {
             cx.state.config_dirty = true;
         }
 
@@ -257,7 +309,7 @@ fn model_row(
 
         egui::ComboBox::from_id_salt(("model_pick", cap))
             .selected_text(format!("从 {} 个中选择", known.len()))
-            .width(140.0)
+            .width(150.0)
             .show_ui(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                     if likely.is_empty() {
@@ -281,7 +333,7 @@ fn model_row(
             });
 
         if let Some(model) = picked {
-            *cx.state.config_draft.provider_mut(provider).model_for_mut(cap) = model;
+            cx.state.config_draft.slot_mut(cap).model = model;
             cx.state.config_dirty = true;
         }
 
@@ -292,86 +344,22 @@ fn model_row(
     });
 }
 
-/// 其它能力里有谁和 `cap` 用了同一家。
-fn shared_capabilities(cx: &ViewCtx<'_>, cap: Capability, provider: ProviderId) -> Vec<&'static str> {
-    Capability::ALL
-        .into_iter()
-        .filter(|other| *other != cap && cx.state.config_draft.routing.get(*other) == provider)
-        .map(capability_title)
-        .collect()
-}
-
-/// 全部服务商的密钥状态一览，方便确认哪些已经填过。
-fn key_overview(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
-    let credentials = cx.state.credentials();
-    let mut clear: Option<(ProviderId, EndpointMode)> = None;
-
-    egui::CollapsingHeader::new(RichText::new("已保存的密钥").small())
-        .id_salt("key_overview")
-        .show(ui, |ui| {
-            widgets::hint(
-                ui,
-                "每家服务商的「官方」与「自定义」是两套独立密钥，切换端点不会互相覆盖。",
-            );
-            ui.add_space(theme::SPACE_XS);
-            for id in ProviderId::ALL {
-                for mode in EndpointMode::ALL {
-                    let present = credentials.has(id, mode);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{:<8}", id.label()))
-                                .monospace()
-                                .small()
-                                .color(theme::TEXT_MUTED),
-                        );
-                        widgets::pill(
-                            ui,
-                            mode.label(),
-                            if mode == EndpointMode::Official {
-                                theme::ACCENT
-                            } else {
-                                theme::INFO
-                            },
-                        );
-                        if present {
-                            ui.label(RichText::new("已配置").small().color(theme::SUCCESS));
-                            let cached = cx.state.settings.known_models(id, mode).len();
-                            if cached > 0 {
-                                widgets::hint(ui, &format!("缓存 {cached} 个模型"));
-                            }
-                            if ui.small_button("清除").clicked() {
-                                clear = Some((id, mode));
-                            }
-                        } else {
-                            ui.label(RichText::new("—").small().color(theme::TEXT_DIM));
-                        }
-                    });
-                }
-            }
-        });
-
-    if let Some((id, mode)) = clear {
-        cx.state.settings.set_key(id, mode, "");
-        cx.state.settings.set_known_models(id, mode, Vec::new());
-        cx.state.keys_dirty = true;
-    }
-}
-
-fn launch_probe(cx: &mut ViewCtx<'_>, id: ProviderId, mode: EndpointMode) {
-    let key = cx.state.settings.key(id, mode).to_string();
-    let settings = cx.state.config_draft.provider(id).clone();
-    let base_url = match mode {
-        EndpointMode::Official => id.official_base_url().to_string(),
-        EndpointMode::Custom => settings.custom_base_url.clone(),
-    };
+fn launch_probe(cx: &mut ViewCtx<'_>, cap: Capability) {
+    let slot = cx.state.config_draft.slot(cap).clone();
+    let key = cx
+        .state
+        .settings
+        .key(cap, slot.provider, slot.mode)
+        .to_string();
     cx.state.submit_probe(
         cx.runtime,
         Job::Probe(ProbeRequest {
-            provider: id,
-            mode,
-            base_url,
+            capability: cap,
+            provider: slot.provider,
+            mode: slot.mode,
+            base_url: slot.base_url(),
             api_key: key,
-            model: settings.chat_model.clone(),
+            model: slot.model.clone(),
         }),
     );
 }

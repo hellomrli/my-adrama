@@ -433,14 +433,19 @@ impl AppState {
         // A connectivity probe doubles as "fetch the model list".
         if let Some(probed) = outcome.models {
             let count = probed.models.len();
-            self.settings
-                .set_known_models(probed.provider, probed.mode, probed.models);
+            self.settings.set_known_models(
+                probed.capability,
+                probed.provider,
+                probed.mode,
+                probed.models,
+            );
             let _ = self.settings.save();
             if count > 0 {
                 self.push_console(
                     Level::Info,
                     format!(
-                        "{} {} 可用模型 {count} 个，已写入下拉列表",
+                        "{}：{} {} 可用模型 {count} 个，已写入下拉列表",
+                        probed.capability.label(),
                         probed.provider.label(),
                         probed.mode.label()
                     ),

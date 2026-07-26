@@ -12,7 +12,7 @@ pub mod stages;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::model::{EndpointMode, Project, ProviderId, Stage, StageStatus};
+use crate::model::{Capability, EndpointMode, Project, ProviderId, Stage, StageStatus};
 use crate::providers::{self, Credentials};
 use events::{JobContext, StageEvent};
 use stages::StageCtx;
@@ -35,6 +35,8 @@ pub enum Job {
 
 #[derive(Debug, Clone)]
 pub struct ProbeRequest {
+    /// 这次探测属于哪种能力——密钥与模型列表都按能力隔离存放。
+    pub capability: Capability,
     pub provider: ProviderId,
     pub mode: EndpointMode,
     pub base_url: String,
@@ -55,6 +57,7 @@ pub struct JobRequest {
 /// instead of making the user type an id that may have been renamed upstream.
 #[derive(Debug, Clone)]
 pub struct ProbedModels {
+    pub capability: Capability,
     pub provider: ProviderId,
     pub mode: EndpointMode,
     pub models: Vec<String>,
@@ -115,7 +118,12 @@ pub fn job_label(job: &Job, dry_run: bool) -> String {
         Job::Export => "拼接成片".to_string(),
         Job::Approve(stage) => format!("审核通过 · {}", stage.label()),
         Job::Reset(stage) => format!("撤销审核 · {}", stage.label()),
-        Job::Probe(p) => format!("测试连接 · {} {}", p.provider.label(), p.mode.label()),
+        Job::Probe(p) => format!(
+            "测试 {} · {} {}",
+            p.capability.label(),
+            p.provider.label(),
+            p.mode.label()
+        ),
     };
     if dry_run && job.touches_api() {
         format!("{base}（演练）")
@@ -171,6 +179,7 @@ pub async fn execute(req: JobRequest, ctx: &JobContext) -> Result<JobOutcome> {
         ctx.info(report.detail.clone());
         let mut outcome = JobOutcome::msg(report.summary).detail(report.detail);
         outcome.models = Some(ProbedModels {
+            capability: p.capability,
             provider: p.provider,
             mode: p.mode,
             models: report.models,
@@ -455,7 +464,7 @@ impl JobContext {
     fn check_routing(&self, project: &Project) {
         for (cap, provider) in project.config.routing_conflicts() {
             self.warn(format!(
-                "「{}」能力被路由到 {}，但它不提供该能力（设置 → 能力路由）",
+                "「{}」选的是 {}，但它不提供该能力（设置 → 模型与密钥）",
                 cap.label(),
                 provider.label()
             ));

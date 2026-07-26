@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::engine::events::{CancelToken, EventSink, JobContext, Level, StageEvent};
 use crate::engine::{self, Job, JobRequest, ProbeRequest};
 use crate::model::{
-    AspectRatio, Capability, EndpointMode, Project, ProjectIndex, ProviderId, Stage,
+    AspectRatio, Capability, Project, ProjectIndex, Stage,
 };
 use crate::settings::AppSettings;
 
@@ -109,13 +109,10 @@ pub enum Command {
     Approve { stage: String },
     /// 撤销某阶段的审核
     Reset { stage: String },
-    /// 测试某个服务商的连通性
+    /// 测试某种能力当前配置的端点是否可用
     Test {
-        /// openai / google / xai
-        provider: String,
-        /// official / custom
-        #[arg(long, default_value = "official")]
-        mode: String,
+        /// chat / image / video
+        capability: String,
     },
     /// 检查（或安装）新版本
     Update {
@@ -123,16 +120,13 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// 列出某个服务商当前提供的模型
+    /// 列出某种能力所配端点当前提供的模型
     Models {
-        /// openai / google / xai
-        provider: String,
-        /// official / custom
-        #[arg(long, default_value = "official")]
-        mode: String,
-        /// 只看某种能力的候选：chat / image / video
+        /// chat / image / video
+        capability: String,
+        /// 列出全部模型，而不只是与该能力相关的
         #[arg(long)]
-        capability: Option<String>,
+        all: bool,
     },
     /// 打开图形界面
     Gui,
@@ -187,38 +181,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_providers(&project, &settings);
             Ok(())
         }
-        Command::Test { provider, mode } => {
-            let project = Project::open(&cli.project).ok();
-            let id: ProviderId = provider.parse()?;
-            let mode = parse_mode(&mode)?;
-            let config = project
-                .as_ref()
-                .map(|p| p.config.clone())
-                .unwrap_or_default();
-            let settings_for_provider = config.provider(id);
-            let base_url = match mode {
-                EndpointMode::Official => id.official_base_url().to_string(),
-                EndpointMode::Custom => settings_for_provider.custom_base_url.clone(),
-            };
-            let credentials = settings.credentials();
-            let api_key = credentials
-                .get(id, mode)
-                .map(str::to_string)
-                .with_context(|| format!("未配置 {} 的{}密钥", id.label(), mode.label()))?;
-
-            dispatch(
-                &cli.project,
-                Job::Probe(ProbeRequest {
-                    provider: id,
-                    mode,
-                    base_url,
-                    api_key,
-                    model: settings_for_provider.chat_model.clone(),
-                }),
-                false,
-                &settings,
-            )
-            .await
+        Command::Test { capability } => {
+            let cap: Capability = capability.parse()?;
+            let request = probe_request(&cli.project, cap, &settings)?;
+            dispatch(&cli.project, Job::Probe(request), false, &settings).await
         }
         Command::Approve { stage } => {
             dispatch(&cli.project, Job::Approve(parse_stage(&stage)?), false, &settings).await
@@ -273,11 +239,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Export { dry_run } => dispatch(&cli.project, Job::Export, dry_run, &settings).await,
         Command::Update { apply } => update_command(apply).await,
-        Command::Models {
-            provider,
-            mode,
-            capability,
-        } => models_command(&cli.project, &provider, &mode, capability.as_deref(), &settings).await,
+        Command::Models { capability, all } => {
+            models_command(&cli.project, &capability, all, &settings).await
+        }
         Command::Gui => unreachable!("GUI 在 main 中提前处理"),
     }
 }
@@ -359,60 +323,85 @@ async fn update_command(apply: bool) -> Result<()> {
     Ok(())
 }
 
-async fn models_command(
-    project_dir: &Path,
-    provider: &str,
-    mode: &str,
-    capability: Option<&str>,
-    settings: &AppSettings,
-) -> Result<()> {
-    let id: ProviderId = provider.parse()?;
-    let mode = parse_mode(mode)?;
+/// 按能力组装一次探测请求：端点来自项目配置，密钥来自本机设置。
+fn probe_request(project_dir: &Path, cap: Capability, settings: &AppSettings) -> Result<ProbeRequest> {
     let config = Project::open(project_dir)
         .map(|p| p.config)
         .unwrap_or_default();
-    let provider_settings = config.provider(id);
-    let base_url = match mode {
-        EndpointMode::Official => id.official_base_url().to_string(),
-        EndpointMode::Custom => provider_settings.custom_base_url.clone(),
-    };
+    let endpoint = config.endpoint(cap);
     let api_key = settings
         .credentials()
-        .get(id, mode)
+        .get(cap, endpoint.provider, endpoint.mode)
         .map(str::to_string)
-        .with_context(|| format!("未配置 {} 的{}密钥", id.label(), mode.label()))?;
+        .with_context(|| {
+            format!(
+                "「{}」还没有配置 {} 的{}密钥",
+                cap.label(),
+                endpoint.provider.label(),
+                endpoint.mode.label()
+            )
+        })?;
 
-    let report = crate::providers::probe(id, mode, &base_url, &api_key, "").await?;
+    Ok(ProbeRequest {
+        capability: cap,
+        provider: endpoint.provider,
+        mode: endpoint.mode,
+        base_url: endpoint.base_url,
+        api_key,
+        model: endpoint.model,
+    })
+}
+
+async fn models_command(
+    project_dir: &Path,
+    capability: &str,
+    all: bool,
+    settings: &AppSettings,
+) -> Result<()> {
+    let cap: Capability = capability.parse()?;
+    let request = probe_request(project_dir, cap, settings)?;
+    let report = crate::providers::probe(
+        request.provider,
+        request.mode,
+        &request.base_url,
+        &request.api_key,
+        &request.model,
+    )
+    .await?;
+
     if report.models.is_empty() {
-        println!("该端点没有返回模型列表（代理可能未实现 /models）");
+        println!("该端点没有返回模型列表（代理可能未实现 /models），模型 ID 需手动填写");
         return Ok(());
     }
 
-    let filter = capability.map(|c| c.parse::<Capability>()).transpose()?;
-    println!("{} · {} — {} 个模型", id.label(), mode.label(), report.models.len());
+    println!(
+        "{} · {} · {} — 共 {} 个模型",
+        cap.label(),
+        request.provider.label(),
+        request.mode.label(),
+        report.models.len()
+    );
+    let mut shown = 0;
     for model in &report.models {
-        match filter {
-            Some(cap) if !crate::providers::looks_like(cap, model) => continue,
-            _ => println!("  {model}"),
+        if all || crate::providers::looks_like(cap, model) {
+            let marker = if *model == request.model { "→" } else { " " };
+            println!("  {marker} {model}");
+            shown += 1;
         }
     }
-    if filter.is_some() {
+    if !all && shown < report.models.len() {
         println!();
-        println!("（按名称启发式筛选，未列出的也可以手动填写）");
+        println!(
+            "（已按名称筛出可能用于「{}」的 {shown} 个；加 --all 看全部 {}）",
+            cap.label(),
+            report.models.len()
+        );
     }
     Ok(())
 }
 
 fn parse_stage(s: &str) -> Result<Stage> {
     s.parse()
-}
-
-fn parse_mode(s: &str) -> Result<EndpointMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "official" | "官方" => Ok(EndpointMode::Official),
-        "custom" | "自定义" => Ok(EndpointMode::Custom),
-        other => anyhow::bail!("未知端点模式：{other}（official / custom）"),
-    }
 }
 
 fn print_status(project: &Project) {
@@ -472,39 +461,24 @@ fn print_status(project: &Project) {
 
 fn print_providers(project: &Project, settings: &AppSettings) {
     let credentials = settings.credentials();
-    println!("能力路由");
+    println!("三种能力各自独立配置（{}）", AppSettings::config_path().display());
     for cap in Capability::ALL {
         let endpoint = project.config.endpoint(cap);
-        let ok = if endpoint.provider.supports(cap) {
-            if credentials.has(endpoint.provider, endpoint.mode) {
-                "✓"
-            } else {
-                "! 缺少密钥"
-            }
+        let ok = if !endpoint.provider.supports(cap) {
+            "✗ 该服务商不提供此能力"
+        } else if credentials.has(cap, endpoint.provider, endpoint.mode) {
+            "✓"
         } else {
-            "✗ 该服务商不支持此能力"
+            "! 缺少密钥"
         };
-        println!(
-            "  {:<4} {:<8} {:<6} {:<32} {ok}",
-            cap.label(),
-            endpoint.provider.label(),
-            endpoint.mode.label(),
-            endpoint.model
-        );
-        println!("        {}", endpoint.base_url);
-    }
-
-    println!();
-    println!("密钥（{}）", AppSettings::config_path().display());
-    for id in ProviderId::ALL {
-        for mode in EndpointMode::ALL {
-            let present = credentials.has(id, mode);
-            println!(
-                "  {:<8} {:<6} {}",
-                id.label(),
-                mode.label(),
-                if present { "已配置" } else { "—" }
-            );
+        println!();
+        println!("{} {ok}", cap.label());
+        println!("  服务商  {} · {}", endpoint.provider.label(), endpoint.mode.label());
+        println!("  地址    {}", endpoint.base_url);
+        println!("  模型    {}", endpoint.model);
+        let cached = settings.known_models(cap, endpoint.provider, endpoint.mode).len();
+        if cached > 0 {
+            println!("  已缓存  {cached} 个可选模型");
         }
     }
 }
