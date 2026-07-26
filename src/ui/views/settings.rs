@@ -671,12 +671,16 @@ fn self_check(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         cx.state.console_open = true;
         cx.state.push_console(
             crate::engine::events::Level::Info,
-            "自检：提交一次演练拆解，只组装 prompt，不会调用模型",
+            "自检开始：验证项目、剧本与配置能否走通，只组装 prompt，不调用模型、不产生费用",
         );
         let was_dry = cx.state.dry_run;
         cx.state.dry_run = true;
         cx.state.submit(cx.runtime, Job::Parse);
         cx.state.dry_run = was_dry;
+        cx.state.push_console(
+            crate::engine::events::Level::Warn,
+            "自检不会真的拆解剧本。要真跑：左侧「解析」页 →「运行拆解」（按钮上不带「演练」字样）",
+        );
     }
     if copy {
         ui.ctx().copy_text(report.text);

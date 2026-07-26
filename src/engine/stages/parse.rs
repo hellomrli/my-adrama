@@ -16,9 +16,22 @@ pub async fn run(ctx: &StageCtx<'_>) -> Result<Breakdown> {
     let schema = prompts::breakdown_schema();
 
     if ctx.dry_run {
-        ctx.events.info("— 演练：以下内容不会发送 —");
-        ctx.events.info(format!("System:\n{}", prompts::PARSE_SYSTEM));
-        ctx.events.info(format!("User:\n{user}"));
+        // 完整 prompt 进日志文件；控制台只放摘要，否则整个剧本会把它糊满。
+        tracing::info!("演练 · System:\n{}", prompts::PARSE_SYSTEM);
+        tracing::info!("演练 · User:\n{user}");
+
+        ctx.events
+            .info("— 演练：以下内容只是预览，不会发送，也不会产生任何费用 —");
+        ctx.events.info(format!(
+            "将发往 {} 的提示词共 {} 字，开头是：\n{}",
+            ctx.config().endpoint(crate::model::Capability::Chat),
+            user.chars().count(),
+            crate::model::index::truncate(&user, 400)
+        ));
+        ctx.events
+            .info("（完整内容见日志文件：设置 → 关于与更新 → 打开日志文件）");
+        ctx.events
+            .warn("这只是演练。要真正调用模型，请关闭顶栏「演练模式」后再点「运行拆解」。");
         return Ok(Breakdown::default());
     }
 
