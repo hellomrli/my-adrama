@@ -229,6 +229,51 @@ impl ChatProvider for GoogleClient {
                 .with_context(|| format!("Gemini 返回的不是合法 JSON：{}", preview(cleaned)))
         })
     }
+
+    fn complete_text<'a>(
+        &'a self,
+        system: &'a str,
+        user: &'a str,
+        on_progress: Option<&'a (dyn Fn(super::http::SseProgress) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let body = json!({
+                "systemInstruction": { "parts": [{ "text": system }] },
+                "contents": [{ "role": "user", "parts": [{ "text": user }] }],
+            });
+            let url = format!("{}?alt=sse", self.model_url("streamGenerateContent"));
+            let text = self
+                .http
+                .send_sse(
+                    "Gemini 文本请求",
+                    || {
+                        self.http
+                            .client()
+                            .post(&url)
+                            .header(API_KEY_HEADER, &self.api_key)
+                            .json(&body)
+                    },
+                    |chunk| {
+                        let parts = collect_parts(chunk);
+                        let joined: String = parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                            .collect();
+                        (!joined.is_empty()).then_some(joined)
+                    },
+                    |progress| {
+                        if let Some(report) = on_progress {
+                            report(progress);
+                        }
+                    },
+                )
+                .await?;
+            if text.trim().is_empty() {
+                bail!("Gemini 未返回文本内容");
+            }
+            Ok(super::openai::strip_code_fences(&text).to_string())
+        })
+    }
 }
 
 impl ImageProvider for GoogleClient {
@@ -261,14 +306,26 @@ impl VideoProvider for GoogleClient {
             let bytes = tokio::fs::read(req.image)
                 .await
                 .with_context(|| format!("读取首帧 {}", req.image.display()))?;
+            let mut instance = json!({
+                "prompt": req.prompt,
+                "image": {
+                    "bytesBase64Encoded": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "mimeType": mime_for(req.image),
+                }
+            });
+            // 末帧：让片段结束在指定画面上，与下一镜的首帧同源，成片才接得上。
+            if let Some(last) = req.last_image {
+                let last_bytes = tokio::fs::read(last)
+                    .await
+                    .with_context(|| format!("读取末帧 {}", last.display()))?;
+                instance["lastFrame"] = json!({
+                    "bytesBase64Encoded":
+                        base64::engine::general_purpose::STANDARD.encode(&last_bytes),
+                    "mimeType": mime_for(last),
+                });
+            }
             let body = json!({
-                "instances": [{
-                    "prompt": req.prompt,
-                    "image": {
-                        "bytesBase64Encoded": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        "mimeType": mime_for(req.image),
-                    }
-                }],
+                "instances": [instance],
                 "parameters": {
                     "aspectRatio": req.aspect.as_str(),
                     "durationSeconds": req.duration_secs,

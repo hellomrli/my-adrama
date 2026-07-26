@@ -21,6 +21,8 @@ pub enum View {
     /// 由 breakdown 推导出的依赖图。
     Flow,
     Stage(Stage),
+    /// 配音与字幕。
+    Audio,
     Settings,
 }
 
@@ -34,6 +36,7 @@ impl View {
             View::Stage(Stage::Assets) => "资产",
             View::Stage(Stage::Storyboard) => "分镜",
             View::Stage(Stage::Video) => "视频",
+            View::Audio => "配音与字幕",
             View::Settings => "设置",
         }
     }
@@ -45,6 +48,7 @@ impl View {
             View::Script => "script".into(),
             View::Flow => "flow".into(),
             View::Stage(stage) => format!("stage:{stage}"),
+            View::Audio => "audio".into(),
             View::Settings => "settings".into(),
         }
     }
@@ -54,6 +58,7 @@ impl View {
             "dashboard" => Some(View::Dashboard),
             "script" => Some(View::Script),
             "flow" => Some(View::Flow),
+            "audio" => Some(View::Audio),
             "settings" => Some(View::Settings),
             other => other
                 .strip_prefix("stage:")
@@ -71,6 +76,7 @@ impl View {
             View::Stage(Stage::Assets) => "角色定妆照与服化道参考图",
             View::Stage(Stage::Storyboard) => "逐镜头画面，复用资产保持一致性",
             View::Stage(Stage::Video) => "分镜图生成视频片段并拼接成片",
+            View::Audio => "台词配音（云端或本地）、SRT 字幕、成片合成选项",
             View::Settings => "按能力配置供应商、密钥与模型",
         }
     }
@@ -172,6 +178,14 @@ pub struct NewProjectForm {
     pub aspect: crate::model::AspectRatio,
 }
 
+/// 本地工具探测结果。
+#[derive(Clone)]
+pub struct ToolProbe {
+    pub ffmpeg: Option<crate::tools::ToolStatus>,
+    pub piper: Option<crate::tools::ToolStatus>,
+    pub piper_voice: Option<std::path::PathBuf>,
+}
+
 /// Prompt being edited in the item inspector.
 pub struct PromptEdit {
     pub stage: Stage,
@@ -194,6 +208,12 @@ pub struct AppState {
     pub selection: HashMap<Stage, String>,
     /// 勾选待生成的条目（每个阶段一份）。
     pub checked: HashMap<Stage, std::collections::BTreeSet<String>>,
+    /// 资产工作台当前分页（None = 全部）。
+    pub asset_tab: Option<crate::model::AssetKind>,
+    /// 正在安装的工具及其进度。
+    pub tool_install: Option<(crate::tools::Tool, u64, u64)>,
+    /// 工具解析缓存（None = 尚未探测）。
+    pub tool_cache: Option<ToolProbe>,
     pub item_filter: ItemFilter,
     pub prompt_edit: Option<PromptEdit>,
     pub thumb_size: f32,
@@ -251,6 +271,9 @@ impl AppState {
             live_status: HashMap::new(),
             selection: HashMap::new(),
             checked: HashMap::new(),
+            asset_tab: None,
+            tool_install: None,
+            tool_cache: None,
             item_filter: ItemFilter::All,
             prompt_edit: None,
             thumb_size,
@@ -350,6 +373,17 @@ impl AppState {
             }
             Update::DownloadProgress { received, total } => {
                 self.updates.download = Some((received, total));
+            }
+            Update::ToolProgress { tool, received, total } => {
+                self.tool_install = Some((tool, received, total));
+            }
+            Update::ToolInstalled(tool, result) => {
+                self.tool_install = None;
+                self.tool_cache = None; // 重新探测
+                match result {
+                    Ok(msg) => self.note(msg),
+                    Err(err) => self.fail(format!("{} 安装失败：{err}", tool.label())),
+                }
             }
             Update::Installed(result) => {
                 self.updates.download = None;
@@ -720,6 +754,20 @@ impl AppState {
         }
     }
 
+    /// 探测本地工具（有缓存；安装完成后失效重测）。
+    pub fn tools(&mut self) -> ToolProbe {
+        if let Some(probe) = &self.tool_cache {
+            return probe.clone();
+        }
+        let probe = ToolProbe {
+            ffmpeg: crate::tools::resolve_ffmpeg(),
+            piper: crate::tools::resolve_piper(),
+            piper_voice: crate::tools::resolve_piper_voice(),
+        };
+        self.tool_cache = Some(probe.clone());
+        probe
+    }
+
     pub fn persist_ui_prefs(&mut self) {
         self.settings.ui.console_open = self.console_open;
         self.settings.ui.thumbnail_size = self.thumb_size;
@@ -748,6 +796,7 @@ mod tests {
                     framing: "中景".into(),
                     camera: "固定".into(),
                     visual: "画面".into(),
+                    visual_end: String::new(),
                     dialogue: String::new(),
                     sfx: String::new(),
                     duration_secs: 5,

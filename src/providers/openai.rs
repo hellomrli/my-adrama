@@ -10,8 +10,8 @@ use std::path::Path;
 
 use super::http::{Http, HttpError};
 use super::{
-    ChatJsonRequest, ChatProvider, ImageProvider, ImageRequest, VideoPoll, VideoProvider,
-    VideoRequest,
+    ChatJsonRequest, ChatProvider, ImageProvider, ImageRequest, SpeechProvider, SpeechRequest,
+    VideoPoll, VideoProvider, VideoRequest,
 };
 use crate::model::Endpoint;
 
@@ -229,6 +229,65 @@ impl ChatProvider for OpenAiCompatible {
                 })
         })
     }
+
+    fn complete_text<'a>(
+        &'a self,
+        system: &'a str,
+        user: &'a str,
+        on_progress: Option<&'a (dyn Fn(super::http::SseProgress) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move { self.chat_text(system, user, on_progress).await })
+    }
+}
+
+impl OpenAiCompatible {
+    /// 纯文本对话（流式）。
+    async fn chat_text(
+        &self,
+        system: &str,
+        user: &str,
+        on_progress: Option<&(dyn Fn(super::http::SseProgress) + Send + Sync)>,
+    ) -> Result<String> {
+        let body = json!({
+            "model": self.endpoint.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": true,
+        });
+        let url = self.url("chat/completions");
+        let text = self
+            .http
+            .send_sse(
+                "对话请求（文本）",
+                || {
+                    self.http
+                        .client()
+                        .post(&url)
+                        .bearer_auth(&self.api_key)
+                        .json(&body)
+                },
+                extract_delta,
+                |progress| {
+                    if let Some(report) = on_progress {
+                        report(progress);
+                    }
+                },
+            )
+            .await?;
+
+        // 上游忽略 stream 时是整包响应
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(content) = value
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+            {
+                return Ok(content.to_string());
+            }
+        }
+        Ok(strip_code_fences(&text).to_string())
+    }
 }
 
 impl ImageProvider for OpenAiCompatible {
@@ -247,6 +306,44 @@ impl ImageProvider for OpenAiCompatible {
             } else {
                 self.image_edit(&req).await
             }
+        })
+    }
+}
+
+impl SpeechProvider for OpenAiCompatible {
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    fn synthesize<'a>(&'a self, req: SpeechRequest<'a>) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let body = json!({
+                "model": self.endpoint.model,
+                "input": req.text,
+                "voice": req.voice,
+                "response_format": "mp3",
+            });
+            let url = self.url("audio/speech");
+            let bytes = self
+                .http
+                .send_bytes("语音合成", || {
+                    self.http
+                        .client()
+                        .post(&url)
+                        .bearer_auth(&self.api_key)
+                        .json(&body)
+                })
+                .await?;
+
+            // 有些中转对错误也回 200 + JSON；音频不可能以 '{' 开头。
+            if bytes.first() == Some(&b'{') {
+                let text = String::from_utf8_lossy(&bytes);
+                bail!("语音端点返回了错误：{}", super::http::preview(&text));
+            }
+            if bytes.is_empty() {
+                bail!("语音端点返回了空音频");
+            }
+            Ok(bytes)
         })
     }
 }
@@ -272,7 +369,7 @@ impl VideoProvider for OpenAiCompatible {
                 base64::engine::general_purpose::STANDARD.encode(&frame)
             );
 
-            let body = json!({
+            let mut body = json!({
                 "model": self.endpoint.model,
                 "prompt": req.prompt,
                 "seconds": req.duration_secs,
@@ -280,6 +377,15 @@ impl VideoProvider for OpenAiCompatible {
                 "aspect_ratio": req.aspect.as_str(),
                 "image": data_url,
             });
+            if let Some(last) = req.last_image {
+                if let Ok(bytes) = tokio::fs::read(last).await {
+                    body["last_image"] = json!(format!(
+                        "data:{};base64,{}",
+                        mime_for(last),
+                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    ));
+                }
+            }
 
             // 先试 /videos，不认再试 /videos/generations。
             let mut last_err = None;

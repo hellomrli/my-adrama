@@ -23,6 +23,7 @@ pub const PARSE_SYSTEM: &str = r#"你是短剧制作的专业拆解助手，负�
 - 镜头需按叙事顺序覆盖整个故事，不得遗漏关键情节。
 - 镜头上的 character_ids / prop_ids / location_id 必须引用你定义过的 id。
 - 画面描述要具体到可画：服装、光线、景别、动作、情绪。
+- 每个镜头除 visual（起始画面）外，给出 visual_end：镜头结束瞬间的画面状态。
 - 只返回符合 schema 的 JSON，不要 markdown、不要解释。"#;
 
 /// Ask the model for a breakdown of this screenplay.
@@ -116,6 +117,84 @@ pub fn storyboard_prompt(style: &str, bd: &Breakdown, shot: &Shot) -> String {
     }
 
     push_clause(&mut s, "此刻台词语境：", &shot.dialogue);
+    s
+}
+
+pub const FORMAT_SYSTEM: &str = r#"你是影视剧本格式整理助手。把用户给的任意形式的故事文本，整理成规范的影视剧剧本，只调整格式与结构，不改动剧情、人物与台词内容（允许为缺失的场景/时间信息做最小限度的合理补全）。
+
+输出格式规范：
+1. 开头：《剧名》，随后一段"类型 / 主要人物 / 场景基调"的简要说明与人物列表。
+2. 场次行："第X场  X-X"；下一行写"内/外  地点  日/夜"。
+3. 动作描述以"△"开头；人物对白用"人物名：台词"；内心独白用"（OS）"，画外音用"VO"。
+4. 字幕、空镜、闪回等特殊内容用【方括号】标注。
+5. 只输出整理后的剧本正文，不要解释、不要 markdown 代码块。"#;
+
+pub fn format_user_prompt(script: &str) -> String {
+    format!("--- 原始文本 ---
+{}
+--- 结束 ---", script.trim())
+}
+
+/// 衔接语：首帧参考上一镜末帧时附加。
+pub const CHAIN_FROM_PREV: &str =
+    "画面需自然衔接参考图中最后一张（上一镜头结尾的画面）：同一时空、光线与人物状态连续。";
+
+/// 衔接语：同一镜头内后续帧参考前一帧时附加。
+pub const CHAIN_SAME_SHOT: &str =
+    "这是同一镜头内时间稍后的画面，人物、服装、场景、光线必须与参考图中最后一张严格一致。";
+
+/// 末帧：镜头结束瞬间的画面。
+pub fn storyboard_last_prompt(style: &str, bd: &Breakdown, shot: &Shot) -> String {
+    let end = if shot.visual_end.trim().is_empty() {
+        format!("{}（镜头结束的瞬间）", shot.visual)
+    } else {
+        shot.visual_end.clone()
+    };
+    let mut s = format!(
+        "{style}，短片单帧画面，无文字、无水印、无字幕。这是镜头**结束瞬间**的画面（末帧）。         景别：{}。机位/运镜：{}。画面内容：{end}。",
+        shot.framing, shot.camera
+    );
+    for cid in &shot.character_ids {
+        if let Some(ch) = bd.character(cid) {
+            s.push_str(&format!("角色 {}：{}", ch.name, ch.appearance));
+            if !ch.costume.trim().is_empty() {
+                s.push_str(&format!("，身着{}", ch.costume));
+            }
+            s.push('。');
+        }
+    }
+    if let Some(loc) = bd.location_for_shot(shot) {
+        push_clause(&mut s, "场景：", &loc.description);
+    }
+    s
+}
+
+/// 中间帧：介于起始与结束之间的过程画面。
+pub fn storyboard_middle_prompt(
+    style: &str,
+    bd: &Breakdown,
+    shot: &Shot,
+    i: u32,
+    total: u32,
+) -> String {
+    let pct = (i - 1) * 100 / (total - 1).max(1);
+    let end = if shot.visual_end.trim().is_empty() {
+        shot.visual.clone()
+    } else {
+        shot.visual_end.clone()
+    };
+    let mut s = format!(
+        "{style}，短片单帧画面，无文字、无水印、无字幕。这是镜头进行到约 {pct}% 的过程画面。         起始状态：{}。结束状态：{end}。景别：{}。机位/运镜：{}。",
+        shot.visual, shot.framing, shot.camera
+    );
+    for cid in &shot.character_ids {
+        if let Some(ch) = bd.character(cid) {
+            s.push_str(&format!("角色 {}：{}。", ch.name, ch.appearance));
+        }
+    }
+    if let Some(loc) = bd.location_for_shot(shot) {
+        push_clause(&mut s, "场景：", &loc.description);
+    }
     s
 }
 
@@ -228,7 +307,7 @@ pub fn breakdown_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "required": [
-                        "id", "scene_id", "number", "framing", "camera", "visual",
+                        "id", "scene_id", "number", "framing", "camera", "visual", "visual_end",
                         "dialogue", "sfx", "duration_secs", "character_ids", "prop_ids", "location_id"
                     ],
                     "properties": {
@@ -238,6 +317,7 @@ pub fn breakdown_schema() -> Value {
                         "framing": { "type": "string" },
                         "camera": { "type": "string" },
                         "visual": { "type": "string" },
+                        "visual_end": { "type": "string" },
                         "dialogue": { "type": "string" },
                         "sfx": { "type": "string" },
                         "duration_secs": { "type": "integer" },
@@ -293,6 +373,7 @@ mod tests {
                 framing: "中景".into(),
                 camera: "手持缓推".into(),
                 visual: "阿明推开仓库大门".into(),
+                visual_end: String::new(),
                 dialogue: "有人吗".into(),
                 sfx: "铁门吱呀".into(),
                 duration_secs: 6,

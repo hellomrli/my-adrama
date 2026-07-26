@@ -15,13 +15,14 @@ pub const SURFACE_ALT: Color32 = Color32::from_rgb(26, 29, 37);
 pub const SURFACE_HOVER: Color32 = Color32::from_rgb(34, 38, 48);
 pub const INPUT: Color32 = Color32::from_rgb(16, 18, 24);
 
-pub const BORDER: Color32 = Color32::from_rgb(42, 46, 58);
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(62, 68, 84);
+pub const BORDER: Color32 = Color32::from_rgb(56, 61, 76);
+pub const BORDER_STRONG: Color32 = Color32::from_rgb(84, 92, 112);
 
 // --- text -------------------------------------------------------------------
-pub const TEXT: Color32 = Color32::from_rgb(232, 235, 243);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(150, 158, 176);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(104, 112, 132);
+// 深色背景上不许再配深色文字：MUTED 是正文级灰，DIM 也必须清晰可读。
+pub const TEXT: Color32 = Color32::from_rgb(238, 241, 248);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(186, 193, 208);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(148, 156, 174);
 
 // --- semantic ---------------------------------------------------------------
 pub const ACCENT: Color32 = Color32::from_rgb(108, 152, 255);

@@ -26,6 +26,7 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let mut do_import = false;
     let mut do_save = false;
     let mut do_revert = false;
+    let mut do_format = false;
 
     ui.horizontal(|ui| {
         if widgets::button(ui, "导入文件…", !cx.state.is_busy()) {
@@ -36,6 +37,14 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         }
         if widgets::button(ui, "放弃修改", dirty) {
             do_revert = true;
+        }
+        ui.separator();
+        if widgets::button(ui, "AI 格式化剧本", !cx.state.is_busy() && script_path.is_some() && !dirty)
+        {
+            do_format = true;
+        }
+        if dirty {
+            widgets::hint(ui, "（先保存才能格式化）");
         }
         ui.separator();
         match &script_path {
@@ -106,5 +115,13 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             cx.state.script_text = snapshot.script_text.clone();
         }
         cx.state.script_dirty = false;
+    }
+
+    if do_format {
+        cx.state.push_console(
+            crate::engine::events::Level::Info,
+            "格式化：整理成标准影视剧本模板（场次/内外景/△动作/台词/OS），原稿自动备份为 .bak",
+        );
+        cx.state.submit(cx.runtime, crate::engine::Job::FormatScript);
     }
 }

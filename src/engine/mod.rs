@@ -8,6 +8,7 @@ pub mod events;
 pub mod pipeline;
 pub mod prompts;
 pub mod stages;
+pub mod subtitles;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -24,6 +25,10 @@ pub enum Job {
     Assets(stages::assets::Selection),
     Storyboard(stages::storyboard::Selection),
     Video(stages::video::Selection),
+    /// 把剧本整理成标准影视剧本模板（原稿自动备份为 .bak）。
+    FormatScript,
+    /// 逐镜头配音（云端 TTS 或本地 Piper）。
+    Voice(stages::voice::Selection),
     /// ffmpeg concatenation of existing clips.
     Export,
     Approve(Stage),
@@ -115,6 +120,12 @@ pub fn job_label(job: &Job, dry_run: bool) -> String {
             1 => format!("重生成视频 {}", sel.shots[0]),
             n => format!("重生成 {n} 个视频"),
         },
+        Job::FormatScript => "格式化剧本".to_string(),
+        Job::Voice(sel) => match sel.shots.len() {
+            0 => "生成配音".to_string(),
+            1 => format!("重生成配音 {}", sel.shots[0]),
+            n => format!("重生成 {n} 条配音"),
+        },
         Job::Export => "拼接成片".to_string(),
         Job::Approve(stage) => format!("审核通过 · {}", stage.label()),
         Job::Reset(stage) => format!("撤销审核 · {}", stage.label()),
@@ -137,7 +148,12 @@ impl Job {
     pub fn touches_api(&self) -> bool {
         matches!(
             self,
-            Job::Parse | Job::Assets(_) | Job::Storyboard(_) | Job::Video(_)
+            Job::Parse
+                | Job::FormatScript
+                | Job::Assets(_)
+                | Job::Storyboard(_)
+                | Job::Video(_)
+                | Job::Voice(_)
         )
     }
 
@@ -203,6 +219,68 @@ pub async fn execute(req: JobRequest, ctx: &JobContext) -> Result<JobOutcome> {
             pipeline::reset(&mut project, stage)?;
             Ok(JobOutcome::msg(format!("已撤销审核：{}", stage.label())).stage(stage))
         }
+        Job::FormatScript => {
+            let (path, script) = project.read_script()?;
+            let user = prompts::format_user_prompt(&script);
+            if dry_run {
+                ctx.info("— 演练：以下内容不会发送 —");
+                ctx.info(format!("System:\n{}", prompts::FORMAT_SYSTEM));
+                ctx.info(format!(
+                    "User（{} 字）：\n{}",
+                    user.chars().count(),
+                    crate::model::index::truncate(&user, 400)
+                ));
+                return Ok(JobOutcome::msg("格式化演练完成（未调用 API）"));
+            }
+
+            let factory = crate::providers::ProviderFactory::new(&project.config, &credentials);
+            let provider = factory.chat()?;
+            ctx.info(format!("调用 {} 整理剧本格式…", provider.endpoint()));
+
+            let events = ctx.clone();
+            let on_progress = move |p: crate::providers::http::SseProgress| {
+                events.progress(
+                    0,
+                    0,
+                    format!("接收中 {} 字 · 已用 {} 秒", p.chars, p.elapsed.as_secs()),
+                );
+            };
+            let formatted = provider
+                .complete_text(prompts::FORMAT_SYSTEM, &user, Some(&on_progress))
+                .await?;
+            let formatted = formatted.trim();
+            if formatted.chars().count() < script.chars().count() / 3 {
+                anyhow::bail!(
+                    "格式化结果过短（{} 字，原文 {} 字），怀疑被截断，已放弃写入",
+                    formatted.chars().count(),
+                    script.chars().count()
+                );
+            }
+
+            // 原稿备份成 .bak（不在剧本扩展名之列，不会被误当作剧本）
+            let backup = path.with_extension(format!(
+                "{}.bak",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("md")
+            ));
+            std::fs::copy(&path, &backup)
+                .with_context(|| format!("备份原稿到 {}", backup.display()))?;
+            crate::model::project::write_atomic(&path, formatted.as_bytes())?;
+            ctx.info(format!("原稿已备份 → {}", backup.display()));
+
+            Ok(JobOutcome::msg(format!(
+                "剧本已格式化（{} 字），原稿备份为 .bak；请在「剧本」页检查后再拆解",
+                formatted.chars().count()
+            )))
+        }
+        Job::Voice(sel) => {
+            // 配音不设门控阶段，但至少要有拆解出的台词
+            if !dry_run {
+                pipeline::require_approved(&project, Stage::Parse)?;
+            }
+            let stage_ctx = stage_ctx(&project, &credentials, ctx, dry_run);
+            let report = stages::voice::run(&stage_ctx, &sel).await?;
+            Ok(JobOutcome::msg(stage_message("配音", &report, dry_run)))
+        }
         Job::Export => {
             let stage_ctx = StageCtx {
                 project: &project,
@@ -211,8 +289,20 @@ pub async fn execute(req: JobRequest, ctx: &JobContext) -> Result<JobOutcome> {
                 dry_run,
             };
             let report = stages::export::run(&stage_ctx).await?;
+            let mut extras = Vec::new();
+            if report.mixed_voice {
+                extras.push("已混入配音");
+            }
+            if report.burned_subs {
+                extras.push("已烧录字幕");
+            }
+            let extra = if extras.is_empty() {
+                String::new()
+            } else {
+                format!("，{}", extras.join("、"))
+            };
             Ok(
-                JobOutcome::msg(format!("成片已生成（{} 个片段）", report.clips))
+                JobOutcome::msg(format!("成片已生成（{} 个片段{extra}）", report.clips))
                     .detail(report.output.display().to_string())
                     .stage(Stage::Video),
             )
@@ -384,6 +474,140 @@ fn save_as_png(source: &std::path::Path, target: &std::path::Path) -> Result<()>
     image
         .save_with_format(target, image::ImageFormat::Png)
         .with_context(|| format!("写入 {}", target.display()))
+}
+
+/// 把整个项目目录打成 tar.gz（Linux 的 tar 与 Windows 10+ 自带的 bsdtar 都认）。
+/// 密钥不在项目目录里，按设计不随包走。
+pub fn pack_project(root: &std::path::Path, dest_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let project = Project::open(root)?;
+    let name = project
+        .root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project")
+        .to_string();
+    let parent = project
+        .root
+        .parent()
+        .with_context(|| "项目目录没有上级目录")?;
+    std::fs::create_dir_all(dest_dir)?;
+    let archive = dest_dir.join(format!("{name}.adrama.tar.gz"));
+
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(parent)
+        .arg(&name)
+        .status()
+        .context("未找到 tar（Linux 自带；Windows 10+ 也自带）")?;
+    if !status.success() {
+        anyhow::bail!("打包失败（tar 退出码 {status}）");
+    }
+    Ok(archive)
+}
+
+/// 解开项目包并返回项目目录（找包里含 project.toml 的目录）。
+pub fn unpack_project(
+    archive: &std::path::Path,
+    parent: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if !archive.is_file() {
+        anyhow::bail!("找不到项目包：{}", archive.display());
+    }
+    std::fs::create_dir_all(parent)?;
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(parent)
+        .status()
+        .context("未找到 tar（Linux 自带；Windows 10+ 也自带）")?;
+    if !status.success() {
+        anyhow::bail!("解包失败（tar 退出码 {status}）");
+    }
+    // 在 parent 下找刚解出来的项目目录
+    for entry in std::fs::read_dir(parent)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() && Project::is_project(&path) {
+            if let Ok(project) = Project::open(&path) {
+                return Ok(project.root);
+            }
+        }
+    }
+    anyhow::bail!("包里没有找到 adrama 项目（缺 project.toml）")
+}
+
+/// 生成 SRT 字幕文件，返回路径与条数。
+pub fn write_subtitles(root: &std::path::Path) -> Result<(std::path::PathBuf, usize)> {
+    let project = Project::open(root)?;
+    let bd = project.load_breakdown()?;
+    let (text, count) = subtitles::srt(&bd);
+    if count == 0 {
+        anyhow::bail!("没有台词，无法生成字幕（拆解里 dialogue 都为空）");
+    }
+    let path = project.subtitles_path();
+    crate::model::project::write_atomic(&path, text.as_bytes())?;
+    Ok((path, count))
+}
+
+/// 导入用户自己的配音（mp3/wav），标记为手动，批量生成不覆盖。
+pub fn import_voice_file(
+    root: &std::path::Path,
+    shot_id: &str,
+    source: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    use crate::model::{ItemStatus, VoiceMeta};
+
+    let project = Project::open(root)?;
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "mp3" | "wav") {
+        anyhow::bail!("配音请提供 .mp3 或 .wav（当前是 .{ext}）");
+    }
+    std::fs::create_dir_all(project.voice_dir())?;
+    // 清掉另一种扩展名的旧文件，避免两个都在时取错
+    for other in ["mp3", "wav"] {
+        if other != ext {
+            let _ = std::fs::remove_file(project.voice_dir().join(format!("{shot_id}.{other}")));
+        }
+    }
+    let target = project.voice_dir().join(format!("{shot_id}.{ext}"));
+    std::fs::copy(source, &target)
+        .with_context(|| format!("复制到 {}", target.display()))?;
+
+    let meta = VoiceMeta {
+        shot_id: shot_id.to_string(),
+        text: String::new(),
+        voice: "手动导入".into(),
+        model: String::new(),
+        status: ItemStatus::Done,
+        error: None,
+        manual: true,
+    };
+    crate::model::project::write_atomic(
+        &project.voice_meta(shot_id),
+        serde_json::to_string_pretty(&meta)?.as_bytes(),
+    )?;
+    Ok(target)
+}
+
+/// 设置某个镜头的分镜帧数覆盖（None = 恢复跟随全局）。
+pub fn set_shot_frames(root: &std::path::Path, shot_id: &str, frames: Option<u32>) -> Result<()> {
+    use crate::model::StoryboardMeta;
+
+    let project = Project::open(root)?;
+    let path = project.storyboard_meta(shot_id);
+    let mut meta: StoryboardMeta = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    meta.shot_id = shot_id.to_string();
+    meta.frames = frames.map(|n| n.clamp(2, 8));
+    crate::model::project::write_atomic(&path, serde_json::to_string_pretty(&meta)?.as_bytes())
 }
 
 /// Persist a hand-edited prompt for a single item so the next run uses it.
@@ -607,6 +831,7 @@ mod tests {
                 framing: "中景".into(),
                 camera: "固定".into(),
                 visual: "画面".into(),
+                visual_end: String::new(),
                 dialogue: String::new(),
                 sfx: String::new(),
                 duration_secs: 5,

@@ -98,6 +98,7 @@ impl eframe::App for AdramaApp {
                     View::Dashboard => views::dashboard::show(ui, &mut cx),
                     View::Script => views::script::show(ui, &mut cx),
                     View::Flow => views::flow::show(ui, &mut cx),
+                    View::Audio => views::audio::show(ui, &mut cx),
                     View::Stage(Stage::Parse) => views::breakdown::show(ui, &mut cx),
                     View::Stage(stage) => views::workbench::show(ui, &mut cx, stage),
                     View::Settings => views::settings::show(ui, &mut cx),
@@ -314,6 +315,7 @@ impl AdramaApp {
                 for stage in Stage::ALL {
                     self.nav_item(ui, View::Stage(stage), stage.label(), Some(stage));
                 }
+                self.nav_item(ui, View::Audio, "配音与字幕", None);
 
                 ui.add_space(theme::SPACE_MD);
                 self.nav_item(ui, View::Settings, "设置", None);

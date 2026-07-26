@@ -29,7 +29,18 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
     crate::ui::views::running_banner(ui, cx);
     ui.add_space(theme::SPACE_SM);
 
-    let items: Vec<ItemView> = cx.state.items(stage).to_vec();
+    // 资产按类别分页：全部 | 角色 | 服装 | 道具 | 场景
+    if stage == Stage::Assets {
+        asset_tabs(ui, cx);
+        ui.add_space(theme::SPACE_XS);
+    }
+
+    let mut items: Vec<ItemView> = cx.state.items(stage).to_vec();
+    if stage == Stage::Assets {
+        if let Some(kind) = cx.state.asset_tab {
+            items.retain(|i| i.kind == crate::model::index::ItemKind::Asset(kind));
+        }
+    }
     if items.is_empty() {
         widgets::empty_state(
             ui,
@@ -63,6 +74,54 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show_inside(ui, |ui| grid(ui, cx, stage, &items));
+}
+
+/// 资产分页签：数量画在页签上，切页不丢勾选。
+fn asset_tabs(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
+    let counts: Vec<(crate::model::AssetKind, usize, usize)> = crate::model::ASSET_KINDS
+        .into_iter()
+        .map(|kind| {
+            let of_kind: Vec<_> = cx
+                .state
+                .items(Stage::Assets)
+                .iter()
+                .filter(|i| i.kind == crate::model::index::ItemKind::Asset(kind))
+                .collect();
+            let pending = of_kind
+                .iter()
+                .filter(|i| !matches!(i.status, ItemStatus::Done | ItemStatus::Approved))
+                .count();
+            (kind, of_kind.len(), pending)
+        })
+        .collect();
+    let total: usize = counts.iter().map(|(_, n, _)| n).sum();
+
+    let mut tab = cx.state.asset_tab;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(tab.is_none(), format!("全部（{total}）"))
+            .clicked()
+        {
+            tab = None;
+        }
+        for (kind, n, pending) in &counts {
+            if *n == 0 {
+                continue;
+            }
+            let label = if *pending > 0 {
+                format!("{}（{n} · {pending} 待生成）", kind.label())
+            } else {
+                format!("{}（{n}）", kind.label())
+            };
+            if ui
+                .selectable_label(tab == Some(*kind), label)
+                .clicked()
+            {
+                tab = Some(*kind);
+            }
+        }
+    });
+    cx.state.asset_tab = tab;
 }
 
 fn toolbar(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
@@ -524,7 +583,55 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
                 ui.label(RichText::new(&item.subtitle).small().color(theme::TEXT_MUTED));
 
                 ui.add_space(theme::SPACE_SM);
-                if let Some(path) = item.thumbnail() {
+                if item.images.len() > 1 {
+                    // 分镜的多帧并排展示：首帧…末帧，一眼看出这镜怎么走
+                    let width = ui.available_width();
+                    let per = ((width - 8.0 * (item.images.len() - 1) as f32)
+                        / item.images.len() as f32)
+                        .clamp(60.0, 220.0);
+                    ui.horizontal(|ui| {
+                        for (i, path) in item.images.iter().enumerate() {
+                            ui.vertical(|ui| {
+                                let texture =
+                                    cx.thumbs.get(ui.ctx(), path, (per * 2.0) as u32);
+                                image_box(ui, per, per * 0.62, texture, "…");
+                                // 分镜的多图是时间序列（首帧…末帧）；
+                                // 资产的多图是不同视角，用文件名说话。
+                                let caption = if stage == Stage::Storyboard {
+                                    if i == 0 {
+                                        "首帧".to_string()
+                                    } else if i == item.images.len() - 1 {
+                                        "末帧".to_string()
+                                    } else {
+                                        format!("第 {} 帧", i + 1)
+                                    }
+                                } else {
+                                    match path.file_stem().and_then(|s| s.to_str()) {
+                                        Some("front") => "正面".to_string(),
+                                        Some("side") => "侧面".to_string(),
+                                        Some("full") => "全身".to_string(),
+                                        Some(other) => other.to_string(),
+                                        None => format!("图 {}", i + 1),
+                                    }
+                                };
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(caption)
+                                                .small()
+                                                .color(theme::TEXT_DIM),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("点击查看大图")
+                                    .clicked()
+                                {
+                                    preview = Some(path.clone());
+                                }
+                            });
+                        }
+                    });
+                } else if let Some(path) = item.thumbnail() {
                     // Cap the preview so the prompt editor and actions stay
                     // above the fold — they are what this panel is for.
                     let width = ui.available_width();
@@ -542,6 +649,11 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
                     if response.on_hover_text("点击查看大图").clicked() {
                         preview = Some(path.to_path_buf());
                     }
+                }
+
+                // 分镜帧数：全局默认，可按镜头覆盖
+                if stage == Stage::Storyboard {
+                    frames_control(ui, cx, &item.id);
                 }
 
                 if let Some(error) = &item.error {
@@ -692,6 +804,54 @@ fn prompt_editor(
         }
         if widgets::button(ui, "恢复默认", true) {
             *reset = true;
+        }
+    });
+}
+
+/// 本镜头的分镜帧数：跟随全局或单独覆盖。改完写进 sidecar，下次生成生效。
+fn frames_control(ui: &mut Ui, cx: &mut ViewCtx<'_>, shot_id: &str) {
+    let Some(root) = cx.state.root() else {
+        return;
+    };
+    let global = cx.state.config_draft.generation.frames_per_shot.clamp(2, 8);
+    let current: Option<u32> = cx
+        .state
+        .snapshot
+        .as_ref()
+        .and_then(|s| {
+            std::fs::read_to_string(
+                s.root.join("storyboard").join(format!("{shot_id}.json")),
+            )
+            .ok()
+        })
+        .and_then(|raw| serde_json::from_str::<crate::model::StoryboardMeta>(&raw).ok())
+        .and_then(|m| m.frames);
+
+    ui.add_space(theme::SPACE_XS);
+    ui.horizontal(|ui| {
+        widgets::hint(ui, &format!("分镜帧数（全局 {global}）："));
+        let mut value = current.unwrap_or(global);
+        let changed = ui
+            .add(egui::Slider::new(&mut value, 2..=8).show_value(true))
+            .on_hover_text("首帧…末帧；末帧会衔接下一镜。改完点「生成这一条」补齐缺的帧")
+            .drag_stopped();
+        if changed && Some(value) != current && !(current.is_none() && value == global) {
+            match crate::engine::set_shot_frames(&root, shot_id, Some(value)) {
+                Ok(()) => {
+                    cx.state.note(format!("{shot_id}：分镜帧数 = {value}"));
+                    cx.state.refresh(cx.runtime);
+                }
+                Err(err) => cx.state.fail(format!("{err:#}")),
+            }
+        }
+        if current.is_some() && ui.small_button("恢复全局").clicked() {
+            match crate::engine::set_shot_frames(&root, shot_id, None) {
+                Ok(()) => {
+                    cx.state.note(format!("{shot_id}：帧数恢复跟随全局（{global}）"));
+                    cx.state.refresh(cx.runtime);
+                }
+                Err(err) => cx.state.fail(format!("{err:#}")),
+            }
         }
     });
 }

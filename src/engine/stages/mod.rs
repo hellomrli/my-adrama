@@ -3,6 +3,7 @@
 
 pub mod assets;
 pub mod export;
+pub mod voice;
 pub mod parse;
 pub mod storyboard;
 pub mod video;
@@ -284,6 +285,7 @@ mod tests {
             framing: "wide".into(),
             camera: "static".into(),
             visual: "v".into(),
+            visual_end: String::new(),
             dialogue: String::new(),
             sfx: String::new(),
             duration_secs: 5,

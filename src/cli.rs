@@ -114,6 +114,42 @@ pub enum Command {
         /// chat / image / video
         capability: String,
     },
+    /// 用 AI 把剧本整理成标准影视剧本模板（原稿备份为 .bak）
+    Format {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 逐镜头配音（云端 TTS 或本地 Piper，按 project.toml 的 audio 设置）
+    Voice {
+        #[arg(long = "shot", value_name = "ID")]
+        shots: Vec<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 生成 SRT 字幕（video/subtitles.srt）
+    Subtitles,
+    /// 把项目打包成 .adrama.tar.gz（迁移到另一台设备）
+    Pack {
+        /// 输出目录（默认当前目录）
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+    },
+    /// 解开项目包
+    Unpack {
+        /// 项目包路径
+        archive: PathBuf,
+        /// 解压到哪个目录（默认当前目录）
+        #[arg(long, default_value = ".")]
+        to: PathBuf,
+    },
+    /// 查看/安装本地工具：ffmpeg、Piper（本地 TTS）、中文音色
+    Tools {
+        /// 安装某个工具：ffmpeg / piper / voice
+        #[arg(long)]
+        install: Option<String>,
+    },
     /// 检查（或安装）新版本
     Update {
         /// 下载并安装，而不只是检查
@@ -238,6 +274,38 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Export { dry_run } => dispatch(&cli.project, Job::Export, dry_run, &settings).await,
+        Command::Format { dry_run } => {
+            dispatch(&cli.project, Job::FormatScript, dry_run, &settings).await
+        }
+        Command::Voice {
+            shots,
+            force,
+            dry_run,
+        } => {
+            let job = Job::Voice(engine::stages::voice::Selection {
+                force: force || !shots.is_empty(),
+                shots,
+            });
+            dispatch(&cli.project, job, dry_run, &settings).await
+        }
+        Command::Subtitles => {
+            let (path, count) = engine::write_subtitles(&cli.project)?;
+            println!("已生成 {count} 条字幕 → {}", path.display());
+            Ok(())
+        }
+        Command::Pack { out } => {
+            let archive = engine::pack_project(&cli.project, &out)?;
+            println!("已打包 → {}", archive.display());
+            println!("（密钥不随包走：新设备上在设置里重新配置，或复制本机的 settings.json）");
+            Ok(())
+        }
+        Command::Unpack { archive, to } => {
+            let root = engine::unpack_project(&archive, &to)?;
+            println!("已导入 → {}", root.display());
+            println!("下一步：adrama --project \"{}\" status", root.display());
+            Ok(())
+        }
+        Command::Tools { install } => tools_command(install.as_deref()).await,
         Command::Update { apply } => update_command(apply).await,
         Command::Models { capability, all } => {
             models_command(&cli.project, &capability, all, &settings).await
@@ -264,6 +332,57 @@ async fn dispatch(root: &Path, job: Job, dry_run: bool, settings: &AppSettings) 
 
     if let Some(detail) = outcome.detail {
         println!("{detail}");
+    }
+    Ok(())
+}
+
+async fn tools_command(install: Option<&str>) -> Result<()> {
+    if let Some(name) = install {
+        let tool = match name.to_ascii_lowercase().as_str() {
+            "ffmpeg" => crate::tools::Tool::Ffmpeg,
+            "piper" => crate::tools::Tool::Piper,
+            "voice" | "音色" => crate::tools::Tool::PiperVoice,
+            other => anyhow::bail!("未知工具：{other}（可选 ffmpeg / piper / voice）"),
+        };
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template("{spinner} [{bar:24}] {bytes}/{total_bytes} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=> "),
+        );
+        bar.set_message(format!("下载 {}", tool.label()));
+        let msg = crate::tools::install(tool, |received, total| {
+            bar.set_length(total.max(received));
+            bar.set_position(received);
+        })
+        .await?;
+        bar.finish_and_clear();
+        println!("✔ {msg}");
+        return Ok(());
+    }
+
+    println!("本地工具（托管目录 {}）", crate::tools::tools_dir().display());
+    match crate::tools::resolve_ffmpeg() {
+        Some(s) => println!(
+            "  ffmpeg   {}（{}）  {}",
+            s.version,
+            if s.managed { "托管" } else { "系统" },
+            s.path.display()
+        ),
+        None => println!("  ffmpeg   未安装  → adrama tools --install ffmpeg"),
+    }
+    match crate::tools::resolve_piper() {
+        Some(s) => println!(
+            "  piper    {}（{}）  {}",
+            s.version,
+            if s.managed { "托管" } else { "系统" },
+            s.path.display()
+        ),
+        None => println!("  piper    未安装  → adrama tools --install piper"),
+    }
+    match crate::tools::resolve_piper_voice() {
+        Some(p) => println!("  音色     {}", p.display()),
+        None => println!("  音色     未安装  → adrama tools --install voice"),
     }
     Ok(())
 }

@@ -369,6 +369,7 @@ fn capability_title(cap: Capability) -> &'static str {
         Capability::Chat => "对话模型",
         Capability::Image => "生图模型",
         Capability::Video => "视频模型",
+        Capability::Speech => "配音模型",
     }
 }
 
@@ -377,6 +378,7 @@ fn capability_color(cap: Capability) -> egui::Color32 {
         Capability::Chat => theme::stage_color(crate::model::Stage::Parse),
         Capability::Image => theme::stage_color(crate::model::Stage::Assets),
         Capability::Video => theme::stage_color(crate::model::Stage::Video),
+        Capability::Speech => theme::INFO,
     }
 }
 
@@ -459,6 +461,12 @@ fn project(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         widgets::field_row(ui, "重试次数", 96.0, |ui| {
             changed |= ui
                 .add(egui::Slider::new(&mut gen.request_retries, 1..=6))
+                .changed();
+        });
+        widgets::field_row(ui, "每镜分镜帧数", 96.0, |ui| {
+            changed |= ui
+                .add(egui::Slider::new(&mut gen.frames_per_shot, 2..=8).suffix(" 帧"))
+                .on_hover_text("首帧…末帧；末帧与下一镜首帧同源，片段之间才接得上。可在分镜页按镜头单独覆盖")
                 .changed();
         });
         if changed {
@@ -694,6 +702,7 @@ struct Diagnostics {
 }
 
 fn diagnostics(cx: &ViewCtx<'_>) -> Diagnostics {
+    let tool_probe = cx.state.tool_cache.clone();
     let state = &cx.state;
     let mut rows: Vec<(bool, String)> = Vec::new();
 
@@ -767,6 +776,27 @@ fn diagnostics(cx: &ViewCtx<'_>) -> Diagnostics {
             ),
         ));
         rows.push((true, format!("    地址 {}", endpoint.base_url)));
+    }
+
+    match &tool_probe {
+        Some(probe) => {
+            rows.push((
+                probe.ffmpeg.is_some(),
+                match &probe.ffmpeg {
+                    Some(s) => format!("ffmpeg：{}（{}）", s.version, if s.managed { "托管" } else { "系统" }),
+                    None => "ffmpeg：未安装（拼接成片需要；「配音与字幕」页可下载）".into(),
+                },
+            ));
+            rows.push((
+                true,
+                match (&probe.piper, &probe.piper_voice) {
+                    (Some(_), Some(_)) => "本地 TTS：Piper + 中文音色已就绪".into(),
+                    (Some(_), None) => "本地 TTS：Piper 已装，缺中文音色（可选）".into(),
+                    _ => "本地 TTS：未安装（可选）".into(),
+                },
+            ));
+        }
+        None => rows.push((true, "本地工具：尚未探测（打开「配音与字幕」页会自动探测）".into())),
     }
 
     if state.config_dirty || state.keys_dirty {

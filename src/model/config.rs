@@ -58,9 +58,16 @@ impl ProviderId {
     pub fn supports(self, cap: Capability) -> bool {
         matches!(
             (self, cap),
-            (ProviderId::OpenAi, Capability::Chat | Capability::Image)
-                | (ProviderId::Google, _)
-                | (ProviderId::Xai, _)
+            (
+                ProviderId::OpenAi,
+                Capability::Chat | Capability::Image | Capability::Speech
+            ) | (
+                ProviderId::Google,
+                Capability::Chat | Capability::Image | Capability::Video
+            ) | (
+                ProviderId::Xai,
+                Capability::Chat | Capability::Image | Capability::Video
+            )
         )
     }
 
@@ -117,16 +124,24 @@ pub enum Capability {
     Chat,
     Image,
     Video,
+    /// 台词转语音（TTS 配音）。
+    Speech,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 3] = [Capability::Chat, Capability::Image, Capability::Video];
+    pub const ALL: [Capability; 4] = [
+        Capability::Chat,
+        Capability::Image,
+        Capability::Video,
+        Capability::Speech,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::Chat => "chat",
             Capability::Image => "image",
             Capability::Video => "video",
+            Capability::Speech => "speech",
         }
     }
 
@@ -135,6 +150,7 @@ impl Capability {
             Capability::Chat => "对话",
             Capability::Image => "图像",
             Capability::Video => "视频",
+            Capability::Speech => "配音",
         }
     }
 
@@ -143,6 +159,7 @@ impl Capability {
             Capability::Chat => "剧本解析（结构化 JSON）",
             Capability::Image => "资产图与分镜图",
             Capability::Video => "分镜图生视频",
+            Capability::Speech => "台词转语音（TTS）",
         }
     }
 }
@@ -161,7 +178,8 @@ impl FromStr for Capability {
             "chat" | "text" | "对话" => Ok(Capability::Chat),
             "image" | "img" | "图像" => Ok(Capability::Image),
             "video" | "视频" => Ok(Capability::Video),
-            other => bail!("未知能力：{other}（可选 chat / image / video）"),
+            "speech" | "tts" | "voice" | "配音" | "语音" => Ok(Capability::Speech),
+            other => bail!("未知能力：{other}（可选 chat / image / video / speech）"),
         }
     }
 }
@@ -296,6 +314,12 @@ impl EndpointConfig {
                 custom_base_url: String::new(),
                 model: "veo-3.1-generate-preview".into(),
             },
+            Capability::Speech => Self {
+                provider: ProviderId::OpenAi,
+                mode: EndpointMode::Official,
+                custom_base_url: String::new(),
+                model: "gpt-4o-mini-tts".into(),
+            },
         }
     }
 
@@ -304,6 +328,7 @@ impl EndpointConfig {
         match (provider, cap) {
             (ProviderId::OpenAi, Capability::Chat) => "gpt-4.1",
             (ProviderId::OpenAi, Capability::Image) => "gpt-image-1",
+            (ProviderId::OpenAi, Capability::Speech) => "gpt-4o-mini-tts",
             (ProviderId::Google, Capability::Chat) => "gemini-2.0-flash",
             (ProviderId::Google, Capability::Image) => "imagen-3.0-generate-002",
             (ProviderId::Google, Capability::Video) => "veo-3.1-generate-preview",
@@ -341,6 +366,31 @@ impl EndpointConfig {
     }
 }
 
+/// 字幕与配音的合成选项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSettings {
+    /// TTS 音色（OpenAI：alloy / echo / fable / onyx / nova / shimmer…）。
+    pub voice: String,
+    /// 用本地 Piper 引擎合成（离线、免额度；需在「配音与字幕」页下载引擎与音色）。
+    #[serde(default)]
+    pub local_tts: bool,
+    /// 拼接成片时，把逐镜头配音合成到音轨（会替换片段原声）。
+    pub mix_voiceover: bool,
+    /// 拼接成片时，把字幕烧录进画面（需要重编码）。
+    pub burn_subtitles: bool,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            voice: "alloy".into(),
+            local_tts: false,
+            mix_voiceover: false,
+            burn_subtitles: false,
+        }
+    }
+}
+
 /// 生成相关的开关。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationSettings {
@@ -356,6 +406,14 @@ pub struct GenerationSettings {
     pub video_timeout_secs: u64,
     /// 每个 HTTP 请求的尝试次数。
     pub request_retries: u32,
+    /// 每个镜头生成的分镜帧数（首帧…末帧）。末帧与下一镜首帧同源，
+    /// 视频用首末两帧约束，片段之间才接得上。可按镜头单独覆盖。
+    #[serde(default = "default_frames_per_shot")]
+    pub frames_per_shot: u32,
+}
+
+fn default_frames_per_shot() -> u32 {
+    2
 }
 
 impl Default for GenerationSettings {
@@ -367,6 +425,7 @@ impl Default for GenerationSettings {
             video_poll_secs: 10,
             video_timeout_secs: 30 * 60,
             request_retries: 3,
+            frames_per_shot: 2,
         }
     }
 }
@@ -381,6 +440,9 @@ pub struct ProjectConfig {
     pub aspect: AspectRatio,
     #[serde(default)]
     pub generation: GenerationSettings,
+    /// 字幕与配音。
+    #[serde(default)]
+    pub audio: AudioSettings,
     /// 每种能力一份端点配置。
     pub endpoints: BTreeMap<Capability, EndpointConfig>,
 }
@@ -392,6 +454,7 @@ impl Default for ProjectConfig {
             style: "cinematic, photorealistic, film grain".into(),
             aspect: AspectRatio::Landscape,
             generation: GenerationSettings::default(),
+            audio: AudioSettings::default(),
             endpoints: Capability::ALL
                 .into_iter()
                 .map(|cap| (cap, EndpointConfig::defaults_for(cap)))
@@ -436,6 +499,9 @@ impl ProjectConfig {
 
     /// 补齐手改配置时漏掉的项。
     pub fn normalize(&mut self) {
+        if self.audio.voice.trim().is_empty() {
+            self.audio.voice = "alloy".into();
+        }
         for cap in Capability::ALL {
             let slot = self
                 .endpoints
@@ -450,6 +516,7 @@ impl ProjectConfig {
         self.generation.max_shot_seconds = self.generation.max_shot_seconds.clamp(2, 60);
         self.generation.video_poll_secs = self.generation.video_poll_secs.clamp(2, 300);
         self.generation.request_retries = self.generation.request_retries.clamp(1, 10);
+        self.generation.frames_per_shot = self.generation.frames_per_shot.clamp(2, 8);
     }
 
     /// 指到了不提供该能力的服务商。
@@ -506,6 +573,8 @@ pub struct RawConfig {
     aspect: Option<AspectRatio>,
     #[serde(default)]
     generation: Option<GenerationSettings>,
+    #[serde(default)]
+    audio: Option<AudioSettings>,
 
     // --- 当前格式 ---
     #[serde(default)]
@@ -590,6 +659,7 @@ impl LegacyProvider {
             Capability::Chat => &self.chat_model,
             Capability::Image => &self.image_model,
             Capability::Video => &self.video_model,
+            Capability::Speech => "",
         }
     }
 }
@@ -610,6 +680,7 @@ impl From<RawConfig> for ProjectConfig {
             style: raw.style,
             aspect: raw.aspect.unwrap_or_default(),
             generation: raw.generation.unwrap_or_default(),
+            audio: raw.audio.unwrap_or_default(),
             endpoints: raw.endpoints.unwrap_or_default(),
         };
 
@@ -624,11 +695,14 @@ impl From<RawConfig> for ProjectConfig {
                         Capability::Chat => r.chat,
                         Capability::Image => r.image,
                         Capability::Video => r.video,
+                        // 旧配置没有配音概念，一律用默认
+                        Capability::Speech => EndpointConfig::defaults_for(cap).provider,
                     })
                     .or(match cap {
                         Capability::Chat => raw.chat_provider,
                         Capability::Image => raw.image_provider,
                         Capability::Video => raw.video_provider,
+                        Capability::Speech => None,
                     })
                     .unwrap_or(EndpointConfig::defaults_for(cap).provider);
 
@@ -832,6 +906,23 @@ mod tests {
     fn capability_parses_from_cli() {
         assert_eq!("image".parse::<Capability>().unwrap(), Capability::Image);
         assert_eq!("视频".parse::<Capability>().unwrap(), Capability::Video);
+        assert_eq!("tts".parse::<Capability>().unwrap(), Capability::Speech);
         assert!("nope".parse::<Capability>().is_err());
+    }
+
+    #[test]
+    fn speech_capability_defaults_and_matrix() {
+        let cfg = ProjectConfig::default();
+        let ep = cfg.endpoint(Capability::Speech);
+        assert_eq!(ep.provider, ProviderId::OpenAi);
+        assert_eq!(ep.model, "gpt-4o-mini-tts");
+        assert!(ProviderId::OpenAi.supports(Capability::Speech));
+        assert!(!ProviderId::Google.supports(Capability::Speech));
+        assert!(!ProviderId::Xai.supports(Capability::Speech));
+        // 旧配置没有 audio 段与 speech 端点：读入后自动补默认
+        let cfg: ProjectConfig = toml::from_str("name='x'\nstyle='s'\naspect='16:9'").unwrap();
+        assert_eq!(cfg.audio.voice, "alloy");
+        assert!(!cfg.audio.mix_voiceover);
+        assert_eq!(cfg.endpoint(Capability::Speech).model, "gpt-4o-mini-tts");
     }
 }

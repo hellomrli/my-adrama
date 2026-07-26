@@ -18,6 +18,15 @@ use crate::engine::{self, Job, JobOutcome, JobRequest};
 use crate::model::{Breakdown, Project, ProjectConfig, ProjectIndex, ProjectState};
 use crate::providers::Credentials;
 
+/// 配音页的一行。
+#[derive(Debug, Clone)]
+pub struct VoiceItem {
+    pub shot_id: String,
+    pub dialogue: String,
+    pub audio: Option<PathBuf>,
+    pub manual: bool,
+}
+
 /// Everything a view needs to render a project, gathered off the UI thread.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -29,6 +38,7 @@ pub struct Snapshot {
     pub script_path: Option<PathBuf>,
     pub script_text: String,
     pub breakdown_json: String,
+    pub voice: Vec<VoiceItem>,
 }
 
 impl Snapshot {
@@ -45,6 +55,28 @@ impl Snapshot {
         };
         let breakdown_json = std::fs::read_to_string(project.breakdown_path()).unwrap_or_default();
 
+        let voice = breakdown
+            .as_ref()
+            .map(|bd| {
+                bd.shots
+                    .iter()
+                    .filter(|s| !s.dialogue.trim().is_empty())
+                    .map(|s| VoiceItem {
+                        shot_id: s.id.clone(),
+                        dialogue: s.dialogue.trim().to_string(),
+                        audio: project.find_voice_clip(&s.id),
+                        manual: std::fs::read_to_string(project.voice_meta(&s.id))
+                            .ok()
+                            .and_then(|raw| {
+                                serde_json::from_str::<crate::model::VoiceMeta>(&raw).ok()
+                            })
+                            .map(|m| m.manual)
+                            .unwrap_or(false),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             root: project.root.clone(),
             config: project.config,
@@ -54,6 +86,7 @@ impl Snapshot {
             script_path,
             script_text,
             breakdown_json,
+            voice,
         })
     }
 }
@@ -68,6 +101,7 @@ enum Request {
 enum Chore {
     CheckUpdate,
     ApplyUpdate(Box<crate::update::ReleaseInfo>),
+    InstallTool(crate::tools::Tool),
     Shutdown,
 }
 
@@ -81,6 +115,13 @@ pub enum Update {
     NewVersion(Result<crate::update::UpdateStatus, String>),
     DownloadProgress { received: u64, total: u64 },
     Installed(Result<crate::update::Applied, String>),
+    /// 工具（ffmpeg / Piper / 音色）安装进度与结果。
+    ToolProgress {
+        tool: crate::tools::Tool,
+        received: u64,
+        total: u64,
+    },
+    ToolInstalled(crate::tools::Tool, Result<String, String>),
 }
 
 pub struct Runtime {
@@ -145,6 +186,11 @@ impl Runtime {
     /// Download and install the given release.
     pub fn apply_update(&self, release: crate::update::ReleaseInfo) {
         let _ = self.chores.send(Chore::ApplyUpdate(Box::new(release)));
+    }
+
+    /// 下载并安装本地工具（ffmpeg / Piper / 音色）。
+    pub fn install_tool(&self, tool: crate::tools::Tool) {
+        let _ = self.chores.send(Chore::InstallTool(tool));
     }
 
     pub fn cancel(&self) {
@@ -253,6 +299,22 @@ fn chore_worker(chores: Receiver<Chore>, updates: Sender<Update>, ctx: egui::Con
                 let _ = updates.send(Update::NewVersion(result));
                 ctx.request_repaint();
             }
+            Chore::InstallTool(tool) => {
+                let progress_tx = updates.clone();
+                let progress_ctx = ctx.clone();
+                let result = rt
+                    .block_on(crate::tools::install(tool, |received, total| {
+                        let _ = progress_tx.send(Update::ToolProgress {
+                            tool,
+                            received,
+                            total,
+                        });
+                        progress_ctx.request_repaint();
+                    }))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = updates.send(Update::ToolInstalled(tool, result));
+                ctx.request_repaint();
+            }
             Chore::ApplyUpdate(release) => {
                 let progress_tx = updates.clone();
                 let progress_ctx = ctx.clone();
@@ -310,6 +372,7 @@ mod tests {
                     framing: "中景".into(),
                     camera: "固定".into(),
                     visual: "画面".into(),
+                    visual_end: String::new(),
                     dialogue: String::new(),
                     sfx: String::new(),
                     duration_secs: 5,

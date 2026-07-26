@@ -144,6 +144,9 @@ pub struct Shot {
     /// camera angle and movement
     pub camera: String,
     pub visual: String,
+    /// 镜头结束瞬间的画面（末帧依据；旧 breakdown 没有此字段则回退到 visual）。
+    #[serde(default)]
+    pub visual_end: String,
     #[serde(default)]
     pub dialogue: String,
     #[serde(default)]
@@ -189,11 +192,37 @@ pub struct StoryboardMeta {
     pub reference_assets: Vec<String>,
     #[serde(default)]
     pub image: Option<String>,
+    /// 末帧文件名。
+    #[serde(default)]
+    pub last_image: Option<String>,
+    /// 本镜头的分镜帧数覆盖（None = 跟随全局设置）。
+    #[serde(default)]
+    pub frames: Option<u32>,
     #[serde(default)]
     pub status: ItemStatus,
     #[serde(default)]
     pub error: Option<String>,
     /// 用户自己放进来的画面：批量重生成时不会被覆盖。
+    #[serde(default)]
+    pub manual: bool,
+}
+
+/// 配音 sidecar（`voice/<shot>.json`）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VoiceMeta {
+    pub shot_id: String,
+    /// 实际合成的台词文本。
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub voice: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub status: ItemStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// 用户自己上传的配音：批量生成时不会被覆盖。
     #[serde(default)]
     pub manual: bool,
 }
@@ -231,6 +260,7 @@ mod tests {
             framing: "medium".into(),
             camera: "static".into(),
             visual: "someone walks in".into(),
+            visual_end: String::new(),
             dialogue: String::new(),
             sfx: String::new(),
             duration_secs: 5,

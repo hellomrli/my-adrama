@@ -40,6 +40,13 @@ pub trait ChatProvider: Send + Sync {
     fn endpoint(&self) -> &Endpoint;
     /// Return a JSON value conforming to `req.schema`.
     fn complete_json<'a>(&'a self, req: ChatJsonRequest<'a>) -> BoxFuture<'a, Result<Value>>;
+    /// 纯文本补全（如剧本格式化）。流式，同样带进度回调。
+    fn complete_text<'a>(
+        &'a self,
+        system: &'a str,
+        user: &'a str,
+        on_progress: Option<&'a (dyn Fn(http::SseProgress) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<String>>;
 }
 
 pub struct ImageRequest<'a> {
@@ -61,8 +68,10 @@ pub trait ImageProvider: Send + Sync {
 
 pub struct VideoRequest<'a> {
     pub prompt: &'a str,
-    /// First frame.
+    /// 首帧。
     pub image: &'a Path,
+    /// 末帧：与下一镜的首帧同源，保证片段之间接得上。
+    pub last_image: Option<&'a Path>,
     pub aspect: AspectRatio,
     pub duration_secs: u32,
 }
@@ -72,6 +81,19 @@ pub struct VideoRequest<'a> {
 pub enum VideoPoll {
     Pending,
     Ready(Vec<u8>),
+}
+
+/// 台词转语音。
+pub struct SpeechRequest<'a> {
+    pub text: &'a str,
+    /// 音色（如 OpenAI 的 alloy / nova / fable…）。
+    pub voice: &'a str,
+}
+
+pub trait SpeechProvider: Send + Sync {
+    fn endpoint(&self) -> &Endpoint;
+    /// 返回音频字节（mp3）。
+    fn synthesize<'a>(&'a self, req: SpeechRequest<'a>) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
 
 /// Image-to-video. Submission and polling are separate so the engine owns the
@@ -249,6 +271,13 @@ impl<'a> ProviderFactory<'a> {
         })
     }
 
+    pub fn speech(&self) -> Result<Arc<dyn SpeechProvider>> {
+        let (endpoint, key) = self.resolve(Capability::Speech)?;
+        let http = self.http(&key, Duration::from_secs(120))?;
+        // 目前只有 OpenAI 兼容形态提供 TTS（官方或中转）。
+        Ok(Arc::new(openai::OpenAiCompatible::new(http, key, endpoint)))
+    }
+
     pub fn video(&self) -> Result<Arc<dyn VideoProvider>> {
         let (endpoint, key) = self.resolve(Capability::Video)?;
         let http = self.http(&key, Duration::from_secs(180))?;
@@ -280,15 +309,17 @@ pub fn looks_like(cap: Capability, model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     let image = ["image", "imagen", "dall-e", "dalle", "flux", "sd-", "stable"];
     let video = ["veo", "video", "sora", "kling", "runway"];
+    let speech = ["tts", "speech", "voice", "audio"];
     match cap {
         Capability::Image => image.iter().any(|k| m.contains(k)),
         Capability::Video => video.iter().any(|k| m.contains(k)),
+        Capability::Speech => speech.iter().any(|k| m.contains(k)),
         Capability::Chat => {
             !image.iter().any(|k| m.contains(k))
                 && !video.iter().any(|k| m.contains(k))
+                && !speech.iter().any(|k| m.contains(k))
                 && !m.contains("embedding")
                 && !m.contains("whisper")
-                && !m.contains("tts")
                 && !m.contains("moderation")
                 && !m.contains("rerank")
         }

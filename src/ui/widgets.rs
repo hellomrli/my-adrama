@@ -9,8 +9,8 @@ use super::theme;
 /// Rounded status chip.
 pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
     egui::Frame::new()
-        .fill(theme::tint(color, 38))
-        .stroke(Stroke::new(1.0_f32, theme::tint(color, 110)))
+        .fill(theme::tint(color, 52))
+        .stroke(Stroke::new(1.0_f32, theme::tint(color, 150)))
         .corner_radius(999.0_f32)
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {

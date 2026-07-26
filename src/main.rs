@@ -9,6 +9,7 @@ mod engine;
 mod model;
 mod providers;
 mod settings;
+mod tools;
 mod ui;
 mod update;
 

@@ -1,6 +1,7 @@
 //! One module per screen. Views read from [`AppState`], draw, and queue
 //! actions; they never call the engine directly except through `state.submit`.
 
+pub mod audio;
 pub mod breakdown;
 pub mod dashboard;
 pub mod flow;

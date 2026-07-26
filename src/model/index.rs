@@ -222,21 +222,33 @@ fn asset_item(
 }
 
 fn storyboard_items(project: &Project, bd: &Breakdown) -> Vec<ItemView> {
+    let global_frames = project.config.generation.frames_per_shot.clamp(2, 8);
     bd.shots
         .iter()
         .map(|shot| {
-            let image = project.storyboard_image(&shot.id);
             let meta: Option<StoryboardMeta> = read_json(&project.storyboard_meta(&shot.id));
-            let exists = image.is_file();
+            let frames = project.storyboard_keyframes(&shot.id);
+            let expected = meta
+                .as_ref()
+                .and_then(|m| m.frames)
+                .unwrap_or(global_frames)
+                .clamp(2, 8) as usize;
+            // 帧齐了才算完成；差帧时「生成缺失」会补齐
+            let exists = frames.len() >= expected;
             let scene = bd.scene(&shot.scene_id).map(|s| s.number);
 
             ItemView {
                 kind: ItemKind::Storyboard,
                 id: shot.id.clone(),
                 title: format!("{} · {}", shot.id, shot.framing),
-                subtitle: truncate(&shot.visual, 80),
+                subtitle: format!(
+                    "{}/{} 帧 · {}",
+                    frames.len(),
+                    expected,
+                    truncate(&shot.visual, 60)
+                ),
                 status: derive_status(meta.as_ref().map(|m| m.status), exists),
-                images: if exists { vec![image] } else { Vec::new() },
+                images: frames,
                 media: None,
                 prompt: meta.as_ref().map(|m| m.prompt.clone()).unwrap_or_default(),
                         references: meta
@@ -354,6 +366,7 @@ mod tests {
                 framing: "medium".into(),
                 camera: "static".into(),
                 visual: "阿明推门而入".into(),
+                visual_end: String::new(),
                 dialogue: String::new(),
                 sfx: String::new(),
                 duration_secs: 5,

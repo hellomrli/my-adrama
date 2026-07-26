@@ -94,7 +94,13 @@ impl Project {
     }
 
     fn skeleton() -> impl Iterator<Item = String> {
-        let mut dirs = vec!["script".to_string(), "parsed".into(), "storyboard".into(), "video".into()];
+        let mut dirs = vec![
+            "script".to_string(),
+            "parsed".into(),
+            "storyboard".into(),
+            "video".into(),
+            "voice".into(),
+        ];
         dirs.extend(ASSET_KINDS.iter().map(|k| format!("assets/{}", k.dir())));
         dirs.into_iter()
     }
@@ -164,8 +170,52 @@ impl Project {
         self.root.join("storyboard")
     }
 
+    /// 第 i 帧（1 起）的文件路径：`<shot>_k1.png` … `<shot>_kN.png`。
+    pub fn storyboard_keyframe(&self, shot_id: &str, i: u32) -> PathBuf {
+        self.storyboard_dir().join(format!("{shot_id}_k{i}.png"))
+    }
+
+    /// 首帧。兼容旧命名 `<shot>.png`（视作第 1 帧）。
     pub fn storyboard_image(&self, shot_id: &str) -> PathBuf {
-        self.storyboard_dir().join(format!("{shot_id}.png"))
+        let k1 = self.storyboard_keyframe(shot_id, 1);
+        if k1.is_file() {
+            return k1;
+        }
+        let legacy = self.storyboard_dir().join(format!("{shot_id}.png"));
+        if legacy.is_file() {
+            legacy
+        } else {
+            k1
+        }
+    }
+
+    /// 已存在的全部关键帧，按序号排列（旧命名视作第 1 帧）。
+    pub fn storyboard_keyframes(&self, shot_id: &str) -> Vec<PathBuf> {
+        let mut frames = Vec::new();
+        let legacy = self.storyboard_dir().join(format!("{shot_id}.png"));
+        let k1 = self.storyboard_keyframe(shot_id, 1);
+        if k1.is_file() {
+            frames.push(k1);
+        } else if legacy.is_file() {
+            frames.push(legacy);
+        }
+        for i in 2..=16u32 {
+            let p = self.storyboard_keyframe(shot_id, i);
+            if p.is_file() {
+                frames.push(p);
+            }
+        }
+        frames
+    }
+
+    /// 末帧（仅当存在第 2 帧及以后时才有）。
+    pub fn storyboard_last(&self, shot_id: &str) -> Option<PathBuf> {
+        let frames = self.storyboard_keyframes(shot_id);
+        if frames.len() >= 2 {
+            frames.last().cloned()
+        } else {
+            None
+        }
     }
 
     pub fn storyboard_meta(&self, shot_id: &str) -> PathBuf {
@@ -186,6 +236,33 @@ impl Project {
 
     pub fn final_cut(&self) -> PathBuf {
         self.video_dir().join("final.mp4")
+    }
+
+    pub fn voice_dir(&self) -> PathBuf {
+        self.root.join("voice")
+    }
+
+    pub fn voice_clip(&self, shot_id: &str) -> PathBuf {
+        self.voice_dir().join(format!("{shot_id}.mp3"))
+    }
+
+    /// 已存在的配音文件：云端 API 是 mp3，本地 Piper 是 wav。
+    pub fn find_voice_clip(&self, shot_id: &str) -> Option<PathBuf> {
+        for ext in ["mp3", "wav"] {
+            let p = self.voice_dir().join(format!("{shot_id}.{ext}"));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    pub fn voice_meta(&self, shot_id: &str) -> PathBuf {
+        self.voice_dir().join(format!("{shot_id}.json"))
+    }
+
+    pub fn subtitles_path(&self) -> PathBuf {
+        self.video_dir().join("subtitles.srt")
     }
 
     // --- documents ---------------------------------------------------------

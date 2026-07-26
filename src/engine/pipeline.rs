@@ -123,6 +123,7 @@ mod tests {
             framing: "wide".into(),
             camera: "static".into(),
             visual: "x".into(),
+            visual_end: String::new(),
             dialogue: String::new(),
             sfx: String::new(),
             duration_secs: 5,
@@ -164,7 +165,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        fs::write(proj.storyboard_image("shot_1"), b"png").unwrap();
+        // 现在每镜默认 2 帧（首帧+末帧），凑齐才算就绪
+        fs::write(proj.storyboard_keyframe("shot_1", 1), b"png").unwrap();
+        fs::write(proj.storyboard_keyframe("shot_1", 2), b"png").unwrap();
 
         approve(&mut proj, Stage::Parse).unwrap();
         approve(&mut proj, Stage::Storyboard).unwrap();

@@ -111,12 +111,20 @@ async fn generate_clip(
 ) -> Result<ItemOutcome> {
     let clip = ctx.project.video_clip(&shot.id);
     let frame = ctx.project.storyboard_image(&shot.id);
+    let last_frame = ctx.project.storyboard_last(&shot.id);
 
     if clip.is_file() && !force {
         return Ok(ItemOutcome::Skipped("已存在，跳过".into()));
     }
     if !frame.is_file() {
         bail!("缺少分镜首帧：{}", frame.display());
+    }
+    if let Some(last) = &last_frame {
+        ctx.events.info(format!(
+            "{}：以首帧+末帧双约束生成（末帧 {}）",
+            shot.id,
+            last.file_name().unwrap_or_default().to_string_lossy()
+        ));
     }
 
     let existing = read_meta(ctx.project, &shot.id);
@@ -145,6 +153,7 @@ async fn generate_clip(
                 .submit(VideoRequest {
                     prompt: &prompt,
                     image: &frame,
+                    last_image: last_frame.as_deref(),
                     aspect,
                     duration_secs: shot.duration_secs.clamp(2, gen.max_shot_seconds),
                 })

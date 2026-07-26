@@ -95,6 +95,9 @@ fn summary_card(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                         widgets::open_path(path);
                     }
                 }
+                if widgets::button(ui, "打包迁移…", true) {
+                    pack_project(cx);
+                }
             });
         });
         ui.add_space(theme::SPACE_SM);
@@ -228,6 +231,29 @@ fn pipeline(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     }
 }
 
+/// 打包当前项目用于迁移：一个 tar.gz 拎走全部产物（密钥不在其中，按设计）。
+fn pack_project(cx: &mut ViewCtx<'_>) {
+    let Some(root) = cx.state.root() else {
+        return;
+    };
+    let Some(dest) = rfd::FileDialog::new()
+        .set_title("项目包放到哪个目录")
+        .pick_folder()
+    else {
+        return;
+    };
+    match crate::engine::pack_project(&root, &dest) {
+        Ok(archive) => {
+            cx.state.note(format!(
+                "已打包 → {}（另一台设备上用「导入项目包」打开；密钥需在新设备重新配置）",
+                archive.display()
+            ));
+            widgets::open_path(&dest);
+        }
+        Err(err) => cx.state.fail(format!("打包失败：{err:#}")),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StageAction {
     Run,
@@ -272,6 +298,11 @@ fn readiness(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         let endpoint = snapshot.config.endpoint(cap);
         let supported = endpoint.provider.supports(cap);
         let has_key = credentials.has(cap, endpoint.provider, endpoint.mode);
+        // 配音是可选能力：没配密钥不算问题（本地 Piper 也不需要密钥）
+        if cap == Capability::Speech && !has_key {
+            rows.push((true, "配音：未配置（可选；本地 Piper 无需密钥）".into()));
+            continue;
+        }
         rows.push((
             supported && has_key,
             format!(
@@ -339,6 +370,7 @@ fn welcome(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let mut open_path: Option<std::path::PathBuf> = None;
     let mut forget: Option<std::path::PathBuf> = None;
     let mut create = false;
+    let mut import_pack = false;
 
     ui.columns(2, |cols| {
         theme::card().show(&mut cols[0], |ui| {
@@ -377,11 +409,17 @@ fn welcome(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                 }
             }
             ui.add_space(theme::SPACE_SM);
-            if widgets::button(ui, "浏览文件夹…", true) {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    open_path = Some(path);
+            ui.horizontal(|ui| {
+                if widgets::button(ui, "浏览文件夹…", true) {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        open_path = Some(path);
+                    }
                 }
-            }
+                if widgets::button(ui, "导入项目包…", true) {
+                    import_pack = true;
+                }
+            });
+            widgets::hint(ui, "项目包 = 「打包迁移」导出的 .adrama.tar.gz，含剧本/拆解/资产/分镜/视频/配音全部内容");
         });
 
         theme::card().show(&mut cols[1], |ui| {
@@ -435,6 +473,25 @@ fn welcome(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     }
     if let Some(path) = open_path {
         cx.state.open_project(cx.runtime, &path);
+    }
+    if import_pack {
+        if let Some(archive) = rfd::FileDialog::new()
+            .add_filter("adrama 项目包", &["gz", "tgz"])
+            .pick_file()
+        {
+            if let Some(parent) = rfd::FileDialog::new()
+                .set_title("解压到哪个目录")
+                .pick_folder()
+            {
+                match crate::engine::unpack_project(&archive, &parent) {
+                    Ok(root) => {
+                        cx.state.note(format!("已导入项目 → {}", root.display()));
+                        cx.state.open_project(cx.runtime, &root);
+                    }
+                    Err(err) => cx.state.fail(format!("导入失败：{err:#}")),
+                }
+            }
+        }
     }
     if create {
         let form = &cx.state.new_project;
