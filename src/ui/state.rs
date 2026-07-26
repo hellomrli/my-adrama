@@ -214,6 +214,8 @@ pub struct AppState {
     pub flow_zoom: f32,
     /// 下一帧把整张图缩放到刚好放得下。
     pub flow_fit: bool,
+    /// 流程图里被点选高亮的节点（稳定 key，如 "asset:char_lin"）。
+    pub flow_selected: Option<String>,
 
     pub new_project: NewProjectForm,
     pub preview: Option<PathBuf>,
@@ -263,6 +265,7 @@ impl AppState {
             flow_pan: eframe::egui::Vec2::new(24.0, 16.0),
             flow_zoom: 1.0,
             flow_fit: true,
+            flow_selected: None,
             new_project: NewProjectForm {
                 parent: std::env::current_dir().ok(),
                 name: "my-drama".into(),

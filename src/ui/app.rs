@@ -412,16 +412,32 @@ impl AdramaApp {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
+                        // 控制台里的文字要能选中复制——报错就是拿来贴给别人看的。
+                        ui.style_mut().interaction.selectable_labels = true;
+                        ui.spacing_mut().item_spacing.y = 3.0;
                         if self.state.console.is_empty() {
                             widgets::hint(ui, "运行任务后，进度与错误会显示在这里。");
                         }
                         for line in &self.state.console {
-                            let color = match line.level {
-                                Level::Info => theme::TEXT_MUTED,
-                                Level::Warn => theme::WARNING,
-                                Level::Error => theme::DANGER,
+                            let (glyph, glyph_color, text_color) = match line.level {
+                                Level::Info => ("·", theme::TEXT_DIM, theme::TEXT_MUTED),
+                                Level::Warn => ("!", theme::WARNING, theme::WARNING),
+                                Level::Error => ("✖", theme::DANGER, theme::DANGER),
                             };
-                            ui.label(RichText::new(&line.text).monospace().size(12.0).color(color));
+                            ui.horizontal_top(|ui| {
+                                ui.label(
+                                    RichText::new(glyph)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(glyph_color),
+                                );
+                                ui.label(
+                                    RichText::new(&line.text)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(text_color),
+                                );
+                            });
                         }
                     });
             });

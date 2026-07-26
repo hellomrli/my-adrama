@@ -43,6 +43,25 @@ fn summary_card(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let aspect = snapshot.config.aspect;
     let final_cut = snapshot.index.final_cut.clone();
 
+    // 流水线一览：每段的完成度与状态，画成一条相连的带子
+    let strip: Vec<(Stage, StageStatus, f32)> = Stage::ALL
+        .into_iter()
+        .map(|stage| {
+            let status = snapshot.state.get(stage);
+            let ratio = match stage {
+                Stage::Parse => {
+                    if snapshot.breakdown.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                other => snapshot.index.counts(other).ratio(),
+            };
+            (stage, status, ratio)
+        })
+        .collect();
+
     theme::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             widgets::stat(ui, &shots.to_string(), "镜头", theme::TEXT);
@@ -82,6 +101,38 @@ fn summary_card(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         ui.horizontal_wrapped(|ui| {
             widgets::pill(ui, aspect.as_str(), theme::ACCENT);
             ui.label(RichText::new(style).small().color(theme::TEXT_MUTED));
+        });
+
+        // 流水线带：四段相连，颜色即阶段，填充即完成度，★ 表示已审核
+        ui.add_space(theme::SPACE_MD);
+        let gap = 6.0;
+        let seg_w = ((ui.available_width() - 3.0 * gap) / 4.0).max(60.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (stage, status, ratio) in &strip {
+                ui.allocate_ui(egui::vec2(seg_w, 30.0), |ui| {
+                    ui.vertical(|ui| {
+                        widgets::meter(ui, *ratio, theme::stage_color(*stage), seg_w);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} {}", stage.ordinal(), stage.label()))
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(status.glyph())
+                                            .small()
+                                            .color(theme::stage_status_color(*status)),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                });
+            }
         });
     });
 }
