@@ -1,120 +1,128 @@
-# AI 短剧生产工作流 — Rust 跨平台应用设计方案
+# adrama 架构说明
 
-> 交付形式：本文档为设计方案，代码由用户自行编写。
+> 目标：一条「剧本 → 拆解 → 资产 → 分镜 → 视频」的 AI 短剧生产流水线，
+> 每个阶段产物落盘、可人工审核、可单条重生成。视频生成很贵，所以**门控**与
+> **单条粒度重跑**是架构的第一约束，而不是事后补的功能。
 
-## Context
+## 分层
 
-目标：搭建一条「剧本 → 资产（角色/服化道）→ 分镜图 → 视频」的 AI 短剧生产流水线。
-- 图像生成：OpenAI `gpt-image-2`（角色定妆照、服装、道具、场景、分镜图）
-- 视频生成：Google 视频模型（用户称 "omni"；**注意**：截至已知信息，Google 的视频生成模型是 **Veo 3 / Veo 3.1**，经 Gemini API 调用，并无 "Omni" 视频模型。建议实现时以 https://ai.google.dev/gemini-api/docs/video 官方文档为准，模型 ID 做成配置项）
-- 语言/平台：Rust，Linux + Windows
-- 流程控制：**分阶段人工确认**——每阶段产物落盘，人工审核/重生成满意后才进入下一阶段（视频生成很贵，避免浪费额度）
-
-## 总体架构
-
-CLI + 桌面 GUI（egui/eframe；无子命令时启动 GUI），以「项目目录」为核心的状态机流水线：
+依赖只向下，不回指：
 
 ```
-adrama new <project>          # 初始化项目
-adrama import script.md       # 导入剧本
-adrama parse                  # 阶段1: LLM 解析剧本 → 结构化 JSON
-adrama assets [--only 角色名] # 阶段2: 生成角色/服化道资产图
-adrama storyboard [--scene N] # 阶段3: 生成分镜图
-adrama video [--shot N]       # 阶段4: 分镜 → 视频片段
-adrama status                 # 查看各阶段状态
-adrama approve <stage>        # 标记阶段通过，解锁下一阶段
-adrama redo <stage> --id X    # 重生成某个单项
+ui/  (egui 桌面端)        cli.rs (命令行)
+        └───────┬────────────┘
+                ▼
+             engine/            阶段编排、门控、任务分发、事件流
+                ▼
+           providers/           能力 trait + HTTP 客户端（OpenAI 兼容 / Gemini）
+                ▼
+             model/             纯数据 + 磁盘布局（无 HTTP、无密钥、无 UI）
 ```
 
-### 项目目录结构（即持久化状态）
+| 模块 | 职责 | 不做什么 |
+|------|------|----------|
+| `model/` | `project.toml`、`state.json`、`breakdown.json` 的结构与读写；产物索引 | 不发请求、不读环境变量 |
+| `providers/` | `ChatProvider` / `ImageProvider` / `VideoProvider` 三个能力 trait 及其实现；密钥以值传递 | 不知道「阶段」的存在 |
+| `engine/` | 四个阶段的编排、prompt 组装、门控规则、`Job` 分发、事件与取消 | 不知道前端是谁 |
+| `cli.rs` / `ui/` | 把 `Job` 交给 engine，把事件渲染成终端输出或界面 | 不含业务规则 |
+
+## 关键设计
+
+### 1. 能力路由靠 trait，而不是 if
+
+项目配置里只声明「哪种能力交给哪家服务商」：
+
+```toml
+[routing]
+chat = "openai"      # 剧本拆解
+image = "openai"     # 资产图 / 分镜图
+video = "google"     # 图生视频
+```
+
+`ProviderFactory` 按能力构造对应客户端，并在构造时就拒绝不可能的组合
+（例如把「视频」路由到只有对话/图像能力的服务商），而不是发出一个形状错误的
+HTTP 请求再让用户去猜 400 的含义。新增服务商 = 实现 trait + 在 `ProviderId`
+增加一个分支，不需要改阶段代码。
+
+### 2. 配置是一张表，不是一堆平铺字段
+
+```toml
+[providers.openai]
+mode = "official"          # official | custom（代理/自建）
+chat_model  = "gpt-4.1"
+image_model = "gpt-image-1"
+custom_base_url = "..."
+```
+
+`providers` 是 `ProviderId → ProviderSettings` 的映射。0.1.x 的平铺字段
+（`openai_chat_model` 等）在读取时自动迁移，老项目直接能开。
+
+### 3. 密钥是值，不是进程环境
+
+旧版把密钥 `set_var` 进进程环境，UI 线程写、worker 线程读——既是数据竞争，
+也没法按任务隔离。现在密钥装在 `Credentials` 里随 `JobRequest` 传递；环境变量
+只在启动时**读取**一次用于补空。密钥文件写在用户配置目录且 `chmod 600`。
+
+### 4. 阶段产出事件，而不是 println
+
+`StageEvent`：`Started / Log / Progress / Item / Artifact / Finished`。
+CLI 渲染成 indicatif 进度条，GUI 渲染成进度条 + 控制台 + 单条状态。
+取消令牌 `CancelToken` 一路传到条目循环内部和 Veo 轮询循环内部——
+30 分钟的视频等待期间点「取消」是真的会停。
+
+### 5. 门控看产物，不看目录
+
+`approve` 之前会真的去数产物（breakdown 里有没有镜头、有没有图、有没有 mp4）。
+旧实现只检查目录是否存在，而目录是 `new` 时就建好的，等于形同虚设。
+撤销某阶段的审核会连带撤销其下游阶段的审核。
+
+### 6. Prompt 落盘即权威
+
+`assets/<kind>/<id>/prompt.txt` 与分镜/视频的 `<shot>.json` 里的 `prompt`
+字段，只要非空就是下次生成使用的文本。界面里改完保存，或者用编辑器手改，
+都直接生效；「恢复默认」清空它即可回到自动组装的版本。
+
+### 7. 产物索引是派生的
+
+`ProjectIndex` 由 breakdown（应该有什么）与磁盘（实际有什么）合成，
+所以未生成的条目也会以「待生成」出现在列表里，而不是等生成后才凭空冒出。
+状态以磁盘为准：sidecar 说 done 但文件不在，就是待生成。
+
+## 目录结构（即持久化状态）
 
 ```
 my-drama/
-├── project.toml          # 项目配置（风格、画幅、模型 ID 覆盖）
-├── script/               # 原始剧本
-├── parsed/
-│   └── breakdown.json    # 结构化剧本：角色表、场景表、镜头表
+├── project.toml          # 名称、风格、画幅、routing、providers、generation
+├── state.json            # 四个阶段的审核状态
+├── script/               # 剧本原文
+├── parsed/breakdown.json # 角色 / 场景 / 场次 / 镜头
 ├── assets/
-│   ├── characters/<name>/   # 定妆照多角度图 + prompt.txt + meta.json
-│   ├── costumes/  props/  locations/
-├── storyboard/
-│   └── s01_shot03.png + s01_shot03.json (prompt、关联资产、审核状态)
-├── video/
-│   └── s01_shot03.mp4 + .json (任务 id、状态)
-└── state.json            # 各阶段审核状态（pending/approved）
+│   ├── characters/<id>/{front,side,full}.png + prompt.txt + meta.json
+│   └── costumes|props|locations/<id>/ref.png + prompt.txt + meta.json
+├── storyboard/<shot>.png + <shot>.json
+└── video/<shot>.mp4 + <shot>.json（含 operation id，可断点续查）
 ```
 
-状态全部落盘为可读文件 → 用户可直接手改 prompt/图片后继续，天然支持断点续跑。
+全部是可读文件：用户可以手改 prompt、换掉某张图，再继续跑。
 
-## 四个阶段的设计
+## 阶段要点
 
-### 阶段 1：剧本解析（LLM）
-- 调 LLM（可用 OpenAI chat API，同一把 key）把剧本解析为结构化 `breakdown.json`：
-  - `characters[]`: 姓名、外貌描述、服装、性格
-  - `scenes[]`: 场景描述、时间、地点
-  - `shots[]`: 每场分镜头——景别、机位、画面内容、台词/音效、时长（≤8s，对齐 Veo 单次生成上限）
-- 用 JSON Schema / structured output 保证可解析。
+| 阶段 | 关键点 |
+|------|--------|
+| 拆解 | 结构化输出。OpenAI 走 `json_schema`，失败自动降级到 `json_object`；Gemini 的 `responseSchema` 不接受 `additionalProperties` 与联合类型，由 `to_gemini_schema` 翻译 |
+| 资产 | 角色三视图（正/侧/全身），同一段身份描述复用；服化道与场景各一张参考图 |
+| 分镜 | **一致性最大的风险点**：把角色定妆照 + 场景图作为参考图输入，同时把外貌描述冗余写进 prompt。图像模型若不支持参考图，会明确告警而不是静默丢失 |
+| 视频 | 提交后先把 operation id 落盘再等待，中断后重跑会**续查**而不是重新付费；超时同样保留 id |
+| 成片 | ffmpeg concat；列表用相对文件名，避免中文/空格路径把命令搞挂 |
 
-### 阶段 2：资产生成（gpt-image-2）
-- 对每个角色生成定妆照（正面/侧面/全身，同一 prompt 加视角后缀），服装、道具、场景各生成参考图。
-- prompt 模板 = 项目风格前缀（project.toml 里的 style，如「电影感、写实、2.35:1」）+ 资产描述。
-- 每个资产的 prompt 存 `prompt.txt`，`redo` 命令允许改后重生成。
+## 并发与成本
 
-### 阶段 3：分镜图生成（gpt-image-2 图像编辑/参考图能力）
-- 关键点：**角色一致性**。用 gpt-image-2 的多图输入/编辑端点，把该镜头涉及的角色定妆照 + 场景参考图作为输入图，prompt 描述镜头构图。
-- 输出画幅与视频一致（16:9 横屏或 9:16 竖屏短剧，project.toml 配置）。
+`[generation]` 段控制：图像默认 3 并发、视频默认串行、单镜头时长上限、
+轮询间隔、超时、重试次数。重试只针对 429/5xx 这类状态码，而不是靠匹配
+错误文本里的关键词。
 
-### 阶段 4：视频生成（Google Veo，image-to-video）
-- 每个 shot：分镜图作首帧 + 镜头运动/表演/台词 prompt → 调 Veo image-to-video。
-- Veo 是异步长任务：提交后轮询 operation 直到完成，下载 mp4。记录任务 id 到 json，支持中断后恢复轮询。
-- 可选收尾：用 ffmpeg（系统依赖或 `ffmpeg-sidecar` crate）按镜头顺序拼接成片。
+## 测试
 
-## Rust 技术选型
-
-| 用途 | crate |
-|---|---|
-| CLI | `clap` (derive) |
-| 异步运行时 + HTTP | `tokio` + `reqwest` (rustls，利于 Windows 交叉编译) |
-| 序列化 | `serde` / `serde_json` / `toml` |
-| 错误处理 | `anyhow` + `thiserror` |
-| 图片 base64 | `base64` |
-| 进度显示 | `indicatif` |
-| 密钥 | 环境变量 `OPENAI_API_KEY` / `GEMINI_API_KEY`（`dotenvy` 支持 .env） |
-
-API 客户端不建议依赖第三方 SDK crate（更新滞后），直接用 reqwest 手写两个薄客户端：
-- `openai.rs`: `POST /v1/images/generations`、`POST /v1/images/edits`（多参考图）、`POST /v1/chat/completions`（剧本解析）
-- `google.rs`: Gemini API `models/veo-3.x:predictLongRunning` + operation 轮询 + 文件下载。**模型 ID 从 project.toml 读取**，方便切换新模型。
-
-## 模块划分建议
-
-```
-src/
-├── main.rs          # clap 命令分发
-├── project.rs       # 项目目录、project.toml、state.json 读写
-├── model/           # breakdown.json 等数据结构
-├── api/openai.rs    # 图像 + LLM 客户端
-├── api/google.rs    # 视频客户端（长任务轮询）
-├── stages/parse.rs / assets.rs / storyboard.rs / video.rs
-└── pipeline.rs      # 阶段门控：上一阶段未 approve 则拒绝执行
-```
-
-## 实施顺序
-
-1. 项目骨架：clap 命令 + project.toml/state.json 读写 + `new`/`status`
-2. 阶段 1 剧本解析（最便宜，先打通 LLM 调用与数据模型）
-3. 阶段 2 资产生成（打通 gpt-image-2）
-4. 阶段 3 分镜（多参考图编辑端点，重点调角色一致性）
-5. 阶段 4 视频（Veo 长任务轮询 + 下载）
-6. 收尾：`redo`/`approve` 门控完善、ffmpeg 拼接、Windows 构建验证（`cargo build --target x86_64-pc-windows-gnu` 或直接 Windows 下构建；用 rustls 避免 OpenSSL 依赖）
-
-## 验证方式
-
-- 用一个 2 场景、4 镜头的迷你剧本走全流程冒烟测试。
-- 每阶段先用 `--dry-run`（只打印将要发送的 prompt，不实际调 API）验证 prompt 组装，再小规模真调。
-- 视频阶段先只跑 1 个 shot 验证轮询/下载逻辑，再批量。
-
-## 风险与注意
-
-- **模型名待查证**：`gpt-image-2` 与 Google "omni" 均以实现当日官方文档为准；本方案已把模型 ID 全部做成配置项，改名零成本。
-- **角色一致性**是成片质量的最大风险点，阶段 3 值得预留最多的调试时间（多参考图 + 详细外貌描述冗余写入 prompt）。
-- 视频生成成本高，务必保留阶段门控与单 shot 粒度的 redo。
+`cargo test` 覆盖：配置迁移与序列化往返、能力路由与缺密钥报错、阶段门控与
+审核撤销、prompt 组装（含参考图冗余与场次继承）、产物索引的磁盘优先规则、
+并发执行器的计数与取消、密钥脱敏。不需要网络。

@@ -1,8 +1,8 @@
 [package]
 name = "adrama"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-description = "AI short-drama production workflow (CLI + GUI)"
+description = "AI short-drama production workflow (GUI + CLI)"
 license = "MIT"
 repository = "https://github.com/hellomrli/my-adrama"
 homepage = "https://github.com/hellomrli/my-adrama"
@@ -29,4 +29,6 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

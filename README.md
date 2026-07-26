@@ -1,150 +1,218 @@
-# my-adrama
+# adrama
 
-AI 短剧生产工作流：**剧本 → 资产 → 分镜 → 视频**。  
-支持 **图形界面（GUI）** 与 **命令行（CLI）**，Linux / Windows。
+**AI 短剧生产工作流：剧本 → 拆解 → 资产 → 分镜 → 视频。**
+一套引擎，两个前端（桌面界面 / 命令行），Windows 与 Linux 都能跑。
 
-仓库：https://github.com/hellomrli/my-adrama
+每个阶段的产物都落盘为可读文件，**人工审核通过后才解锁下一阶段**——视频生成很贵，
+这条门控是有意为之。任何一条资产 / 分镜 / 片段都能单独改 prompt、单独重生成。
 
-## 下载（云编译产物）
+---
 
-GitHub Actions 会在推送与 Release 时构建：
+## 下载与试用
 
-- **Windows**：`adrama.exe` / `adrama-windows-x86_64.zip`
-- **Linux**：`adrama_*.deb`、`adrama-linux-x86_64`
+云端构建产物在 [Releases](https://github.com/hellomrli/my-adrama/releases/latest)：
 
-安装 deb：
+| 平台 | 文件 | 用法 |
+|------|------|------|
+| Windows | `adrama.exe` 或 `adrama-windows-x86_64.zip` | 双击 exe 直接开界面 |
+| Debian / Ubuntu | `adrama_*_amd64.deb` | `sudo dpkg -i adrama_*_amd64.deb`，缺依赖时 `sudo apt-get install -f` |
+| 其它 Linux | `adrama-linux-x86_64` | `chmod +x adrama-linux-x86_64 && ./adrama-linux-x86_64` |
 
-```bash
-sudo dpkg -i adrama_0.1.0_amd64.deb
-# 若缺依赖：
-sudo apt-get install -f
-```
+Linux 需要一款中文字体（`sudo apt install fonts-noto-cjk`），否则界面显示为方块。
+拼接成片需要系统里有 `ffmpeg`（可选）。
 
-## 依赖
+### 五分钟上手
 
-- Rust 1.75+
-- 环境变量：`OPENAI_API_KEY`、`GEMINI_API_KEY`
-- 可选：系统 `ffmpeg`（视频阶段 `--concat` 拼接成片）
+1. 启动程序（无参数即打开界面）。
+2. **设置 → 服务商与密钥**：填 OpenAI / Google 的 Key，点「测试」确认连通，再点「保存密钥」。
+3. **概览 → 新建项目**，选好画幅（横屏 16:9 / 竖屏 9:16）。
+4. **剧本**页：导入 `.md/.txt` 或直接写，保存。
+5. 回到**概览**，按流水线卡片逐阶段「运行 → 检查 → 审核通过」。
+   - 先勾选顶栏 **演练模式** 跑一遍：只显示将要发送的 prompt，不花钱。
+   - 每个阶段的页面里可以单条查看、改 prompt、重生成。
+6. 视频阶段完成后，「拼接成片」得到 `video/final.mp4`。
 
-## 安装
+> 建议第一次只跑一个镜头（视频页选中某条 → 重新生成此条）确认额度和效果，再批量。
 
-```bash
-cargo install --path .
-# 或
-cargo build --release
-```
+---
 
-### Windows 发布包（从 Linux 交叉编译）
+## 界面
 
-需要 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 与 Rust target `x86_64-pc-windows-gnullvm`：
-
-```bash
-rustup target add x86_64-pc-windows-gnullvm
-# 将 llvm-mingw 的 bin 加入 PATH 后：
-./scripts/package-windows.sh
-```
-
-产物在 `dist/`（含 `adrama.exe`）。双击即可打开 GUI。
-
-## 图形界面
-
-无参数启动即打开 GUI（Windows 下双击 `adrama.exe` 同样如此）：
-
-```bash
-adrama
-# 或
-adrama gui
-adrama --gui --project ./my-drama
-```
-
-界面功能（简体中文）：
-
-| 区域 | 说明 |
+| 页面 | 内容 |
 |------|------|
-| 工作流画布 | 类似 ComfyUI 的节点图：剧本→解析→资产→分镜→视频→成片，可拖拽/缩放/运行/审核 |
-| 项目总览 | 新建 / 打开项目、快捷运行各阶段 |
-| 剧本 / 解析 / 资产 / 分镜 / 视频 | 分阶段操作、筛选、重生成、预览 |
-| 设置 | **Image2 / Omni·Veo / Grok / 自定义** 的 Base URL、模型名、API Key；能力路由 |
-| 演练模式 | 顶栏勾选 Dry-run：只组装 prompt，不调 API |
+| **概览** | 四阶段流水线卡片（状态 / 完成度 / 运行 / 审核）、运行前检查（剧本、能力路由、密钥是否齐备）、拆解提醒 |
+| **剧本** | 导入或直接编写剧本原文 |
+| **拆解** | 结构化查看角色表与按场次分组的镜头表（景别、时长、台词），可切原始 JSON |
+| **资产 / 分镜 / 视频** | 条目工作台：网格列出**全部应生成项**（含尚未生成的），右侧检查器可看大图、改 prompt、单条重生成；工具栏有「生成缺失 / 全部重生成 / 重试失败 / 审核通过」 |
+| **设置** | 每家服务商的官方/自定义端点与密钥、能力路由、模型 ID、并发与超时参数 |
 
-密钥保存在本机 `~/.config/adrama/settings.json`（Windows: `%APPDATA%\adrama\settings.json`），不写进项目目录。
+- 顶栏 **演练模式**：只组装并展示 prompt，不调用任何付费接口。
+- 底部**控制台**：实时进度、逐条状态与失败原因；任务运行中随时可取消（视频轮询中也能立刻停）。
+- 密钥存在 `~/.config/adrama/settings.json`（Windows：`%APPDATA%\adrama\settings.json`），
+  权限 600，不会写进项目目录。
 
-### API 密钥：官方 / 自定义（每种独立）
-
-| 厂商 | 官方 Key | 自定义 Key | 官方 Base URL |
-|------|----------|------------|---------------|
-| OpenAI / Image2 | `OPENAI_API_KEY` | `ADRAMA_OPENAI_CUSTOM_KEY` | `https://api.openai.com/v1` |
-| Google / Veo | `GEMINI_API_KEY` | `ADRAMA_GOOGLE_CUSTOM_KEY` | Gemini `v1beta` |
-| xAI / Grok | `XAI_API_KEY` | `ADRAMA_XAI_CUSTOM_KEY` | `https://api.x.ai/v1` |
-
-在 GUI **设置 → API 密钥** 中为每家切换「官方 / 自定义」，自定义模式可填代理 URL；两套密钥互不影响。
-
-**能力路由**（设置 → 能力路由）：对话 / 图像 / 视频 可分别指定使用 OpenAI、Google 或 Grok。
-
-### 其它 GUI 能力
-
-- 深色主题侧栏导航、卡片式页面、工作流画布
-- 中文字体自动加载 · 取消任务 · 剧本编辑保存
-- 图片预览 · 最近项目 · 连接测试 · API 自动重试
+---
 
 ## 命令行
 
-```bash
-export OPENAI_API_KEY=...
-export GEMINI_API_KEY=...
+界面能做的，命令行都能做（同一套引擎）：
 
+```bash
 adrama new my-drama --style "cinematic, photorealistic" --aspect 16:9
 cd my-drama
 adrama import ../examples/mini_script.md
 
-adrama parse --dry-run
+adrama parse --dry-run        # 只打印将要发送的 prompt
 adrama parse
 adrama approve parse
 
-adrama assets --dry-run
-adrama assets
+adrama assets                 # 缺什么补什么
+adrama assets --only char_li_ming --force
 adrama approve assets
 
-adrama storyboard
+adrama storyboard --scene 1
 adrama approve storyboard
 
 adrama video --shot shot_s01_01
-adrama video --concat
-adrama approve video
-
+adrama export                 # ffmpeg 拼接成片
 adrama status
 ```
-
-### 命令一览
 
 | 命令 | 说明 |
 |------|------|
 | `adrama` / `adrama gui` | 打开图形界面 |
-| `adrama new <name>` | 初始化项目目录 |
+| `adrama new <name>` | 初始化项目（`--style` / `--aspect`） |
 | `adrama import <file>` | 导入剧本 |
-| `adrama parse` | 阶段1：LLM 解析剧本 |
-| `adrama assets [--only NAME]` | 阶段2：角色/服化道/场景图 |
-| `adrama storyboard [--scene N] [--shot ID]` | 阶段3：分镜图 |
-| `adrama video [--shot ID] [--concat]` | 阶段4：视频片段 |
-| `adrama status` | 查看状态 |
-| `adrama approve <stage>` | 审核通过，解锁下一阶段 |
-| `adrama redo <stage> --id X` | 重生成单项 |
+| `adrama parse` | 阶段 1：拆解剧本为结构化 JSON |
+| `adrama assets [--only ID]…` | 阶段 2：角色 / 服化道 / 场景图 |
+| `adrama storyboard [--scene N] [--shot ID]…` | 阶段 3：分镜图 |
+| `adrama video [--shot ID]…` | 阶段 4：视频片段 |
+| `adrama export` | 拼接成片 |
+| `adrama status` | 项目状态与各阶段完成度 |
+| `adrama providers` | 查看能力路由与密钥配置情况 |
+| `adrama test <provider>` | 测试连通性（`--mode official\|custom`） |
+| `adrama approve <stage>` / `reset <stage>` | 审核通过 / 撤销审核 |
 
-全局参数：`--project <dir>`、`--gui`、各生成命令的 `--dry-run`。
+通用参数：`--project <dir>`、`--dry-run`、`--force`（覆盖已有产物）、
+`--reset-prompt`（丢弃手改的 prompt，按 breakdown 重新组装）。
 
-## 配置
+---
 
-`project.toml` 可覆盖模型 ID 与 API base URL：
+## 服务商与能力路由
+
+「对话 / 图像 / 视频」三种能力各自指定由哪家承担：
+
+| 服务商 | 对话 | 图像 | 视频 | 官方 Base URL |
+|--------|------|------|------|---------------|
+| OpenAI | ✓ | ✓ | — | `https://api.openai.com/v1` |
+| Google | ✓ | ✓ | ✓ | `https://generativelanguage.googleapis.com/v1beta` |
+| xAI / Grok | ✓ | ✓ | — | `https://api.x.ai/v1` |
+
+把某种能力指到不支持它的服务商，会在开跑前直接报错并列出可选项，
+而不是发出一个形状错误的请求让你去猜 400 的含义。
+
+每家都有**官方 / 自定义**两套独立密钥与地址（自定义用于代理或自建网关），
+切换模式不会覆盖另一套。环境变量可用于补空（不覆盖已保存的值）：
+
+| 服务商 | 官方 Key | 自定义 Key |
+|--------|----------|------------|
+| OpenAI | `OPENAI_API_KEY` | `ADRAMA_OPENAI_CUSTOM_KEY` |
+| Google | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `ADRAMA_GOOGLE_CUSTOM_KEY` |
+| xAI | `XAI_API_KEY` / `GROK_API_KEY` | `ADRAMA_XAI_CUSTOM_KEY` |
+
+模型 ID 全部是配置项，官方改名时改配置即可。Google 的图像能力按模型名自动选端点：
+`imagen-*` 走 `:predict`，`gemini-*` 图像模型走 `:generateContent`——只有后者支持参考图，
+**角色一致性**依赖它。
+
+---
+
+## 项目目录（即持久化状态）
+
+```
+my-drama/
+├── project.toml          # 风格、画幅、能力路由、各服务商端点与模型、生成参数
+├── state.json            # 各阶段审核状态
+├── script/               # 剧本原文
+├── parsed/breakdown.json # 角色 / 场景 / 场次 / 镜头
+├── assets/…              # 每个资产一个目录：图片 + prompt.txt + meta.json
+├── storyboard/…          # <shot>.png + <shot>.json
+└── video/…               # <shot>.mp4 + <shot>.json（含任务 id，中断后可续查）
+```
+
+全是可读文件：可以手改 prompt、替换某张图，再继续跑。
+`prompt.txt` 与 sidecar 里的 `prompt` 只要非空，就是下次生成使用的文本；
+想回到自动组装的版本用「恢复默认」或 `--reset-prompt`。
+
+`project.toml` 示例：
 
 ```toml
 name = "my-drama"
 style = "cinematic, photorealistic, film grain"
 aspect = "16:9"
-openai_image_model = "gpt-image-1"
-openai_chat_model = "gpt-4.1"
-google_video_model = "veo-3.1-generate-preview"
-openai_base_url = "https://api.openai.com/v1"
-google_base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+[routing]
+chat = "openai"
+image = "openai"
+video = "google"
+
+[generation]
+image_concurrency = 3     # 图像并发
+video_concurrency = 1     # 视频串行，避免成本失控
+max_shot_seconds = 8
+video_poll_secs = 10
+video_timeout_secs = 1800
+request_retries = 3
+
+[providers.openai]
+mode = "official"         # official | custom
+chat_model = "gpt-4.1"
+image_model = "gpt-image-1"
+
+[providers.google]
+mode = "official"
+chat_model = "gemini-2.0-flash"
+image_model = "imagen-3.0-generate-002"
+video_model = "veo-3.1-generate-preview"
 ```
 
-也可在 GUI → Settings 中编辑并保存。模型名称以官方文档为准。
+0.1.x 的旧 `project.toml`（平铺的 `openai_chat_model` 等字段）打开时自动迁移，
+老项目可以直接继续用。
+
+---
+
+## 0.2.0 有什么变化
+
+整体重构 + 界面重写。值得注意的行为变化：
+
+- **能力路由现在是真的**。0.1.x 无论怎么配都只会调 OpenAI（图像/对话）或 Google（视频），
+  路由到别家会发出形状错误的请求；现在按能力构造对应客户端，不支持的组合直接拒绝。
+- **审核门控真的检查产物**。旧版只看输出目录在不在（而目录是新建项目时就建好的），
+  空分镜也能 approve 并解锁最贵的视频阶段。
+- **进度与取消可用**。逐条状态、进度条、失败原因都会实时出现在控制台；
+  取消能打断视频轮询，而不是等 30 分钟。
+- **条目级审校**：每条产物都能单独查看、改 prompt、重生成；未生成的条目也会列出来。
+- **手改 prompt 现在生效**（旧版写了 `prompt.txt` 但从不读取）。
+- **密钥不再写进程环境变量**，改为随任务传值；配置文件权限收紧到 600。
+- 图像可并发（默认 3）、视频默认串行；重试基于 HTTP 状态码而不是匹配错误文本。
+- 视频任务 id 先落盘再等待，中断/超时后重跑会**续查**而不是重新付费。
+
+---
+
+## 从源码构建
+
+```bash
+cargo build --release      # 或 cargo install --path .
+cargo test                 # 60 个单元测试，不需要网络
+```
+
+依赖：Rust 1.75+。Linux 构建 GUI 需要
+`libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev pkg-config`。
+
+从 Linux 交叉编译 Windows 包（需 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)）：
+
+```bash
+rustup target add x86_64-pc-windows-gnullvm
+./scripts/package-windows.sh     # 产物在 dist/
+```
+
+架构说明见 [DESIGN.md](DESIGN.md)。许可证 MIT。
