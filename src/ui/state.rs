@@ -71,15 +71,15 @@ impl View {
             View::Stage(Stage::Assets) => "角色定妆照与服化道参考图",
             View::Stage(Stage::Storyboard) => "逐镜头画面，复用资产保持一致性",
             View::Stage(Stage::Video) => "分镜图生成视频片段并拼接成片",
-            View::Settings => "服务商密钥、能力路由与项目参数",
+            View::Settings => "按能力配置供应商、密钥与模型",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
-    Providers,
-    Routing,
+    /// 按能力组织的供应商 / 端点 / 密钥 / 模型。
+    Models,
     Project,
     About,
 }
@@ -235,7 +235,7 @@ impl AppState {
             .unwrap_or(View::Dashboard);
         Self {
             view,
-            settings_tab: SettingsTab::Providers,
+            settings_tab: SettingsTab::Models,
             snapshot: None,
             busy: None,
             console: VecDeque::new(),

@@ -1,5 +1,8 @@
-//! Settings: provider credentials, capability routing, project parameters,
-//! and the in-app updater.
+//! 设置。
+//!
+//! 密钥这一块按**能力**组织，而不是按服务商：一张卡回答「这件事找谁做、
+//! 连哪里、用什么密钥、跑哪个模型」。端点与密钥在服务商层面是共用的，
+//! 所以两种能力选了同一家时会明确提示，避免改了一处影响另一处却不自知。
 
 use eframe::egui::{self, RichText, Ui};
 
@@ -12,13 +15,14 @@ use crate::ui::state::{SettingsTab, View};
 use crate::ui::{theme, widgets};
 use crate::update::{self, UpdateStatus};
 
+const LABEL_W: f32 = 72.0;
+
 pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     widgets::page_header(ui, View::Settings.title(), View::Settings.subtitle());
 
     ui.horizontal(|ui| {
         for (tab, label) in [
-            (SettingsTab::Providers, "服务商与密钥"),
-            (SettingsTab::Routing, "能力路由"),
+            (SettingsTab::Models, "模型与密钥"),
             (SettingsTab::Project, "项目参数"),
             (SettingsTab::About, "关于与更新"),
         ] {
@@ -41,92 +45,33 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| match cx.state.settings_tab {
-            SettingsTab::Providers => providers(ui, cx),
-            SettingsTab::Routing => routing(ui, cx),
+            SettingsTab::Models => capabilities(ui, cx),
             SettingsTab::Project => project(ui, cx),
             SettingsTab::About => about(ui, cx),
         });
 }
 
 // ---------------------------------------------------------------------------
-// 服务商与密钥
+// 模型与密钥：一种能力一张卡
 // ---------------------------------------------------------------------------
 
-fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
-    let busy = cx.state.is_busy();
+fn capabilities(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
+    widgets::hint(
+        ui,
+        "先选这项能力交给谁，再填该服务商的地址与密钥，最后从拉取到的模型里挑一个。",
+    );
+    ui.add_space(theme::SPACE_SM);
+
     let mut probe: Option<(ProviderId, EndpointMode)> = None;
-
-    for id in ProviderId::ALL {
-        theme::card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                widgets::dot(ui, provider_color(id), 10.0);
-                ui.label(RichText::new(id.label()).size(15.0).strong());
-                ui.label(RichText::new(id.tagline()).small().color(theme::TEXT_MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for cap in Capability::ALL.into_iter().rev() {
-                        let color = if id.supports(cap) {
-                            theme::SUCCESS
-                        } else {
-                            theme::TEXT_DIM
-                        };
-                        widgets::pill(ui, cap.label(), color);
-                    }
-                });
-            });
-
-            ui.add_space(theme::SPACE_SM);
-            widgets::field_row(ui, "端点模式", 84.0, |ui| {
-                let settings = cx.state.config_draft.provider_mut(id);
-                for mode in EndpointMode::ALL {
-                    if ui
-                        .selectable_value(&mut settings.mode, mode, mode.label())
-                        .changed()
-                    {
-                        cx.state.config_dirty = true;
-                    }
-                }
-            });
-
-            // --- 官方端点 ---
-            ui.add_space(theme::SPACE_SM);
-            widgets::hint(ui, &format!("官方地址 {}", id.official_base_url()));
-            if key_row(ui, cx, id, EndpointMode::Official, busy, "sk-… / AIza…") {
-                probe = Some((id, EndpointMode::Official));
-            }
-
-            // --- 自定义端点 ---
-            ui.add_space(theme::SPACE_SM);
-            widgets::field_row(ui, "自定义地址", 84.0, |ui| {
-                let settings = cx.state.config_draft.provider_mut(id);
-                if widgets::text_field(
-                    ui,
-                    &mut settings.custom_base_url,
-                    280.0,
-                    "https://proxy.example.com/v1",
-                ) {
-                    cx.state.config_dirty = true;
-                }
-            });
-            let custom_ready = !cx
-                .state
-                .config_draft
-                .provider(id)
-                .custom_base_url
-                .trim()
-                .is_empty();
-            if key_row(ui, cx, id, EndpointMode::Custom, busy && custom_ready, "代理 / 自建服务密钥")
-                && custom_ready
-            {
-                probe = Some((id, EndpointMode::Custom));
-            }
-
-            // --- 模型 ---
-            ui.add_space(theme::SPACE_SM);
-            models_section(ui, cx, id);
-        });
+    for cap in Capability::ALL {
+        if let Some(request) = capability_card(ui, cx, cap) {
+            probe = Some(request);
+        }
         ui.add_space(theme::SPACE_SM);
     }
 
+    key_overview(ui, cx);
+    ui.add_space(theme::SPACE_SM);
     save_bar(ui, cx);
 
     if let Some((id, mode)) = probe {
@@ -134,44 +79,282 @@ fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     }
 }
 
-/// 一行密钥输入 + 显示/隐藏 + 测试按钮。返回是否点了测试。
-fn key_row(
+/// 返回值：本帧是否请求了「测试并拉取模型」。
+fn capability_card(
     ui: &mut Ui,
     cx: &mut ViewCtx<'_>,
-    id: ProviderId,
-    mode: EndpointMode,
-    busy: bool,
-    hint: &str,
-) -> bool {
-    let mut test = false;
-    let label = format!("{}密钥", mode.label());
-    widgets::field_row(ui, &label, 84.0, |ui| {
-        let mut key = cx.state.settings.key(id, mode).to_string();
-        let reveal_key = format!("{id}.{}", mode.label());
-        let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
-        if widgets::secret_field(ui, &mut key, &mut revealed, 280.0, hint) {
-            cx.state.settings.set_key(id, mode, key.clone());
-            cx.state.keys_dirty = true;
-        }
-        cx.state.revealed.insert(reveal_key, revealed);
+    cap: Capability,
+) -> Option<(ProviderId, EndpointMode)> {
+    let busy = cx.state.is_busy();
+    let provider = cx.state.config_draft.routing.get(cap);
+    let mode = cx.state.config_draft.provider(provider).mode;
+    let shared_with = shared_capabilities(cx, cap, provider);
+    let mut probe = None;
 
-        if ui
-            .add_enabled(
-                !busy && !key.trim().is_empty(),
-                egui::Button::new("测试并拉取模型"),
-            )
-            .on_hover_text("验证密钥是否可用，并把上游当前提供的模型列表拉下来")
-            .clicked()
-        {
-            test = true;
+    theme::card().show(ui, |ui| {
+        // 标题
+        ui.horizontal(|ui| {
+            widgets::dot(ui, capability_color(cap), 10.0);
+            ui.label(RichText::new(capability_title(cap)).size(15.0).strong());
+            ui.label(
+                RichText::new(cap.description())
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ready = cx.state.credentials().has(provider, mode)
+                    && !cx
+                        .state
+                        .config_draft
+                        .provider(provider)
+                        .model_for(cap)
+                        .trim()
+                        .is_empty();
+                widgets::pill(
+                    ui,
+                    if ready { "可用" } else { "未配置完整" },
+                    if ready { theme::SUCCESS } else { theme::WARNING },
+                );
+            });
+        });
+
+        // 1. 供应商
+        ui.add_space(theme::SPACE_SM);
+        widgets::field_row(ui, "供应商", LABEL_W, |ui| {
+            for id in ProviderId::ALL {
+                let supported = id.supports(cap);
+                let selected = cx.state.config_draft.routing.get(cap) == id;
+                let text = RichText::new(id.label()).color(if supported {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                });
+                let response = ui
+                    .add_enabled(supported, egui::SelectableLabel::new(selected, text))
+                    .on_hover_text(id.tagline())
+                    .on_disabled_hover_text(format!("{} 不提供{}能力", id.label(), cap.label()));
+                if response.clicked() {
+                    cx.state.config_draft.routing.set(cap, id);
+                    cx.state.config_dirty = true;
+                }
+            }
+        });
+
+        // 2. 端点
+        widgets::field_row(ui, "端点", LABEL_W, |ui| {
+            let settings = cx.state.config_draft.provider_mut(provider);
+            for m in EndpointMode::ALL {
+                if ui
+                    .selectable_value(&mut settings.mode, m, m.label())
+                    .changed()
+                {
+                    cx.state.config_dirty = true;
+                }
+            }
+            if mode == EndpointMode::Official {
+                ui.label(
+                    RichText::new(provider.official_base_url())
+                        .small()
+                        .monospace()
+                        .color(theme::TEXT_DIM),
+                );
+            }
+        });
+        if mode == EndpointMode::Custom {
+            widgets::field_row(ui, "地址", LABEL_W, |ui| {
+                let settings = cx.state.config_draft.provider_mut(provider);
+                if widgets::text_field(
+                    ui,
+                    &mut settings.custom_base_url,
+                    320.0,
+                    "https://proxy.example.com/v1",
+                ) {
+                    cx.state.config_dirty = true;
+                }
+            });
         }
 
-        let cached = cx.state.settings.known_models(id, mode).len();
-        if cached > 0 {
-            widgets::hint(ui, &format!("已缓存 {cached} 个模型"));
+        // 3. 密钥（含测试）
+        widgets::field_row(ui, "密钥", LABEL_W, |ui| {
+            let mut key = cx.state.settings.key(provider, mode).to_string();
+            let reveal_key = format!("{provider}.{}", mode.label());
+            let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
+            if widgets::secret_field(ui, &mut key, &mut revealed, 300.0, key_hint(provider)) {
+                cx.state.settings.set_key(provider, mode, key.clone());
+                cx.state.keys_dirty = true;
+            }
+            cx.state.revealed.insert(reveal_key, revealed);
+
+            let url_ready = mode == EndpointMode::Official
+                || !cx
+                    .state
+                    .config_draft
+                    .provider(provider)
+                    .custom_base_url
+                    .trim()
+                    .is_empty();
+            if ui
+                .add_enabled(
+                    !busy && !key.trim().is_empty() && url_ready,
+                    egui::Button::new("测试并拉取模型"),
+                )
+                .on_hover_text("验证密钥是否可用，并把该服务商当前提供的模型拉下来")
+                .clicked()
+            {
+                probe = Some((provider, mode));
+            }
+        });
+
+        // 4. 模型
+        model_row(ui, cx, cap, provider, mode);
+
+        if !shared_with.is_empty() {
+            ui.add_space(theme::SPACE_XS);
+            widgets::hint(
+                ui,
+                &format!(
+                    "端点与密钥与「{}」共用（都走 {}），改这里也会影响那边。",
+                    shared_with.join("、"),
+                    provider.label()
+                ),
+            );
         }
     });
-    test
+
+    probe
+}
+
+fn model_row(
+    ui: &mut Ui,
+    cx: &mut ViewCtx<'_>,
+    cap: Capability,
+    provider: ProviderId,
+    mode: EndpointMode,
+) {
+    let known: Vec<String> = cx.state.settings.known_models(provider, mode).to_vec();
+    let current = cx
+        .state
+        .config_draft
+        .provider(provider)
+        .model_for(cap)
+        .to_string();
+
+    widgets::field_row(ui, "模型", LABEL_W, |ui| {
+        let settings = cx.state.config_draft.provider_mut(provider);
+        if widgets::text_field(ui, settings.model_for_mut(cap), 240.0, "模型 ID") {
+            cx.state.config_dirty = true;
+        }
+
+        if known.is_empty() {
+            widgets::hint(ui, "点「测试并拉取模型」后可从列表选择");
+            return;
+        }
+
+        // 与本能力相关的排前面，其余照列——厂商改名太频繁，隐藏比列出更危险。
+        let (likely, others): (Vec<&String>, Vec<&String>) =
+            known.iter().partition(|m| looks_like(cap, m));
+        let mut picked: Option<String> = None;
+
+        egui::ComboBox::from_id_salt(("model_pick", cap))
+            .selected_text(format!("从 {} 个中选择", known.len()))
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    if likely.is_empty() {
+                        widgets::hint(ui, "没有明显匹配的，以下是全部");
+                    }
+                    for model in &likely {
+                        if ui.selectable_label(**model == current, *model).clicked() {
+                            picked = Some((*model).clone());
+                        }
+                    }
+                    if !others.is_empty() {
+                        ui.separator();
+                        widgets::hint(ui, "其它模型");
+                        for model in &others {
+                            if ui.selectable_label(**model == current, *model).clicked() {
+                                picked = Some((*model).clone());
+                            }
+                        }
+                    }
+                });
+            });
+
+        if let Some(model) = picked {
+            *cx.state.config_draft.provider_mut(provider).model_for_mut(cap) = model;
+            cx.state.config_dirty = true;
+        }
+
+        if !current.trim().is_empty() && !known.iter().any(|m| m == &current) {
+            widgets::pill(ui, "不在列表中", theme::WARNING)
+                .on_hover_text("上游没有列出这个模型；可能已下线，或代理未返回全部模型");
+        }
+    });
+}
+
+/// 其它能力里有谁和 `cap` 用了同一家。
+fn shared_capabilities(cx: &ViewCtx<'_>, cap: Capability, provider: ProviderId) -> Vec<&'static str> {
+    Capability::ALL
+        .into_iter()
+        .filter(|other| *other != cap && cx.state.config_draft.routing.get(*other) == provider)
+        .map(capability_title)
+        .collect()
+}
+
+/// 全部服务商的密钥状态一览，方便确认哪些已经填过。
+fn key_overview(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
+    let credentials = cx.state.credentials();
+    let mut clear: Option<(ProviderId, EndpointMode)> = None;
+
+    egui::CollapsingHeader::new(RichText::new("已保存的密钥").small())
+        .id_salt("key_overview")
+        .show(ui, |ui| {
+            widgets::hint(
+                ui,
+                "每家服务商的「官方」与「自定义」是两套独立密钥，切换端点不会互相覆盖。",
+            );
+            ui.add_space(theme::SPACE_XS);
+            for id in ProviderId::ALL {
+                for mode in EndpointMode::ALL {
+                    let present = credentials.has(id, mode);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{:<8}", id.label()))
+                                .monospace()
+                                .small()
+                                .color(theme::TEXT_MUTED),
+                        );
+                        widgets::pill(
+                            ui,
+                            mode.label(),
+                            if mode == EndpointMode::Official {
+                                theme::ACCENT
+                            } else {
+                                theme::INFO
+                            },
+                        );
+                        if present {
+                            ui.label(RichText::new("已配置").small().color(theme::SUCCESS));
+                            let cached = cx.state.settings.known_models(id, mode).len();
+                            if cached > 0 {
+                                widgets::hint(ui, &format!("缓存 {cached} 个模型"));
+                            }
+                            if ui.small_button("清除").clicked() {
+                                clear = Some((id, mode));
+                            }
+                        } else {
+                            ui.label(RichText::new("—").small().color(theme::TEXT_DIM));
+                        }
+                    });
+                }
+            }
+        });
+
+    if let Some((id, mode)) = clear {
+        cx.state.settings.set_key(id, mode, "");
+        cx.state.settings.set_known_models(id, mode, Vec::new());
+        cx.state.keys_dirty = true;
+    }
 }
 
 fn launch_probe(cx: &mut ViewCtx<'_>, id: ProviderId, mode: EndpointMode) {
@@ -193,143 +376,28 @@ fn launch_probe(cx: &mut ViewCtx<'_>, id: ProviderId, mode: EndpointMode) {
     );
 }
 
-/// 每个能力一行：可直接输入，也可从拉取到的模型列表里选。
-fn models_section(ui: &mut Ui, cx: &mut ViewCtx<'_>, id: ProviderId) {
-    let mode = cx.state.config_draft.provider(id).mode;
-    let known: Vec<String> = cx.state.settings.known_models(id, mode).to_vec();
-
-    egui::CollapsingHeader::new(RichText::new("模型 ID").small())
-        .id_salt(("models", id))
-        .default_open(true)
-        .show(ui, |ui| {
-            if known.is_empty() {
-                widgets::hint(
-                    ui,
-                    "点上方「测试并拉取模型」后，这里会出现可选模型；也可以直接手填。",
-                );
-            }
-            for cap in Capability::ALL {
-                if !id.supports(cap) {
-                    continue;
-                }
-                widgets::field_row(ui, cap.label(), 84.0, |ui| {
-                    let current = cx.state.config_draft.provider(id).model_for(cap).to_string();
-
-                    let settings = cx.state.config_draft.provider_mut(id);
-                    if widgets::text_field(ui, settings.model_for_mut(cap), 240.0, "模型 ID") {
-                        cx.state.config_dirty = true;
-                    }
-
-                    if known.is_empty() {
-                        return;
-                    }
-                    // 相关的排在前面，但不隐藏其它——厂商命名经常变。
-                    let (likely, others): (Vec<&String>, Vec<&String>) =
-                        known.iter().partition(|m| looks_like(cap, m));
-
-                    let mut picked: Option<String> = None;
-                    egui::ComboBox::from_id_salt(("pick", id, cap))
-                        .selected_text("从列表选择")
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                                for model in &likely {
-                                    if ui
-                                        .selectable_label(**model == current, *model)
-                                        .clicked()
-                                    {
-                                        picked = Some((*model).clone());
-                                    }
-                                }
-                                if !others.is_empty() {
-                                    ui.separator();
-                                    widgets::hint(ui, "其它模型");
-                                    for model in &others {
-                                        if ui
-                                            .selectable_label(**model == current, *model)
-                                            .clicked()
-                                        {
-                                            picked = Some((*model).clone());
-                                        }
-                                    }
-                                }
-                            });
-                        });
-
-                    if let Some(model) = picked {
-                        *cx.state.config_draft.provider_mut(id).model_for_mut(cap) = model;
-                        cx.state.config_dirty = true;
-                    }
-
-                    if !current.trim().is_empty() && !known.iter().any(|m| m == &current) {
-                        widgets::pill(ui, "不在列表中", theme::WARNING);
-                    }
-                });
-            }
-        });
+fn capability_title(cap: Capability) -> &'static str {
+    match cap {
+        Capability::Chat => "对话模型",
+        Capability::Image => "生图模型",
+        Capability::Video => "视频模型",
+    }
 }
 
-// ---------------------------------------------------------------------------
-// 能力路由
-// ---------------------------------------------------------------------------
+fn capability_color(cap: Capability) -> egui::Color32 {
+    match cap {
+        Capability::Chat => theme::stage_color(crate::model::Stage::Parse),
+        Capability::Image => theme::stage_color(crate::model::Stage::Assets),
+        Capability::Video => theme::stage_color(crate::model::Stage::Video),
+    }
+}
 
-fn routing(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
-    let credentials = cx.state.credentials();
-
-    theme::card().show(ui, |ui| {
-        widgets::section_title(ui, "每种能力由哪家服务商承担");
-        widgets::hint(
-            ui,
-            "灰色表示该服务商不提供这项能力；选中它会在运行前直接报错，而不是发出错误请求。",
-        );
-        ui.add_space(theme::SPACE_MD);
-
-        for cap in Capability::ALL {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(cap.label()).strong());
-                ui.label(RichText::new(cap.description()).small().color(theme::TEXT_DIM));
-            });
-            ui.horizontal(|ui| {
-                for id in ProviderId::ALL {
-                    let supported = id.supports(cap);
-                    let selected = cx.state.config_draft.routing.get(cap) == id;
-                    let label = RichText::new(id.label()).color(if supported {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_DIM
-                    });
-                    if ui
-                        .add_enabled(supported, egui::SelectableLabel::new(selected, label))
-                        .clicked()
-                    {
-                        cx.state.config_draft.routing.set(cap, id);
-                        cx.state.config_dirty = true;
-                    }
-                }
-            });
-
-            let endpoint = cx.state.config_draft.endpoint(cap);
-            let has_key = credentials.has(endpoint.provider, endpoint.mode);
-            ui.horizontal_wrapped(|ui| {
-                widgets::pill(ui, endpoint.mode.label(), theme::ACCENT);
-                ui.label(
-                    RichText::new(format!("{} · {}", endpoint.model, endpoint.base_url))
-                        .small()
-                        .monospace()
-                        .color(theme::TEXT_DIM),
-                );
-                widgets::pill(
-                    ui,
-                    if has_key { "密钥已配置" } else { "缺少密钥" },
-                    if has_key { theme::SUCCESS } else { theme::WARNING },
-                );
-            });
-            ui.add_space(theme::SPACE_MD);
-        }
-    });
-
-    ui.add_space(theme::SPACE_SM);
-    save_bar(ui, cx);
+fn key_hint(id: ProviderId) -> &'static str {
+    match id {
+        ProviderId::OpenAi => "sk-…",
+        ProviderId::Google => "AIza…",
+        ProviderId::Xai => "xai-…",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +523,6 @@ fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             }
         });
 
-        // 下载进度
         if let Some((received, total)) = downloading {
             ui.add_space(theme::SPACE_SM);
             let ratio = if total > 0 {
@@ -470,7 +537,6 @@ fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             );
         }
 
-        // 已完成
         if let Some(applied) = &cx.state.updates.applied {
             ui.add_space(theme::SPACE_SM);
             theme::inset().show(ui, |ui| {
@@ -492,7 +558,6 @@ fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             });
         }
 
-        // 检查结果
         ui.add_space(theme::SPACE_SM);
         match &cx.state.updates.last_result {
             None => widgets::hint(ui, "还没有检查过更新。"),
@@ -545,7 +610,10 @@ fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                     } else if !has_asset {
                         widgets::hint(
                             ui,
-                            &format!("该版本没有当前平台的产物（{}）", update::platform_asset_name()),
+                            &format!(
+                                "该版本没有当前平台的产物（{}）",
+                                update::platform_asset_name()
+                            ),
                         );
                     } else {
                         widgets::hint(ui, "此副本由包管理器安装，请用 apt / dpkg 更新");
@@ -604,9 +672,9 @@ fn save_bar(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             if widgets::primary_button(
                 ui,
                 if config_dirty {
-                    "保存项目配置 *"
+                    "保存到项目 *"
                 } else {
-                    "保存项目配置"
+                    "保存到项目"
                 },
                 config_dirty && has_project,
             ) {
@@ -615,8 +683,10 @@ fn save_bar(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             if widgets::button(ui, "放弃改动", config_dirty) {
                 revert = true;
             }
-            if !has_project {
-                widgets::hint(ui, "项目配置需要先打开一个项目");
+            if has_project {
+                widgets::hint(ui, "供应商、端点与模型属于项目配置，写入 project.toml；密钥只存本机");
+            } else {
+                widgets::hint(ui, "供应商与模型需要先打开一个项目才能保存");
             }
         });
     });
@@ -634,12 +704,3 @@ fn save_bar(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
         cx.state.config_dirty = false;
     }
 }
-
-fn provider_color(id: ProviderId) -> egui::Color32 {
-    match id {
-        ProviderId::OpenAi => theme::SUCCESS,
-        ProviderId::Google => theme::INFO,
-        ProviderId::Xai => theme::WARNING,
-    }
-}
-
