@@ -117,6 +117,23 @@ pub enum Command {
         #[arg(long, default_value = "official")]
         mode: String,
     },
+    /// 检查（或安装）新版本
+    Update {
+        /// 下载并安装，而不只是检查
+        #[arg(long)]
+        apply: bool,
+    },
+    /// 列出某个服务商当前提供的模型
+    Models {
+        /// openai / google / xai
+        provider: String,
+        /// official / custom
+        #[arg(long, default_value = "official")]
+        mode: String,
+        /// 只看某种能力的候选：chat / image / video
+        #[arg(long)]
+        capability: Option<String>,
+    },
     /// 打开图形界面
     Gui,
 }
@@ -255,6 +272,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Export { dry_run } => dispatch(&cli.project, Job::Export, dry_run, &settings).await,
+        Command::Update { apply } => update_command(apply).await,
+        Command::Models {
+            provider,
+            mode,
+            capability,
+        } => models_command(&cli.project, &provider, &mode, capability.as_deref(), &settings).await,
         Command::Gui => unreachable!("GUI 在 main 中提前处理"),
     }
 }
@@ -277,6 +300,105 @@ async fn dispatch(root: &Path, job: Job, dry_run: bool, settings: &AppSettings) 
 
     if let Some(detail) = outcome.detail {
         println!("{detail}");
+    }
+    Ok(())
+}
+
+async fn update_command(apply: bool) -> Result<()> {
+    let install = crate::update::install_kind();
+    println!("当前版本  {}", crate::update::CURRENT_VERSION);
+    println!("安装方式  {}", install.describe());
+
+    let release = match crate::update::check().await? {
+        crate::update::UpdateStatus::UpToDate => {
+            println!("已是最新版本");
+            return Ok(());
+        }
+        crate::update::UpdateStatus::Available(release) => release,
+    };
+
+    println!("新版本    {} （{}）", release.version, release.page_url);
+    for line in release.notes.lines().take(12) {
+        println!("  {line}");
+    }
+    if !apply {
+        println!();
+        println!("加 --apply 下载并安装；或直接从上面的发布页下载。");
+        return Ok(());
+    }
+
+    if !install.can_self_update() {
+        anyhow::bail!("{}", install.describe());
+    }
+
+    let bar = ProgressBar::new(0);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner} [{bar:24}] {bytes}/{total_bytes} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+    );
+    bar.set_message("下载中");
+
+    let applied = crate::update::download_and_apply(&release, |received, total| {
+        bar.set_length(total);
+        bar.set_position(received);
+    })
+    .await?;
+    bar.finish_and_clear();
+
+    println!(
+        "✔ 已更新到 {}{}",
+        applied.version,
+        if applied.verified {
+            "（SHA-256 校验通过）"
+        } else {
+            "（该 release 未提供校验和）"
+        }
+    );
+    println!("重新运行 {} 即可使用新版本。", applied.executable.display());
+    Ok(())
+}
+
+async fn models_command(
+    project_dir: &Path,
+    provider: &str,
+    mode: &str,
+    capability: Option<&str>,
+    settings: &AppSettings,
+) -> Result<()> {
+    let id: ProviderId = provider.parse()?;
+    let mode = parse_mode(mode)?;
+    let config = Project::open(project_dir)
+        .map(|p| p.config)
+        .unwrap_or_default();
+    let provider_settings = config.provider(id);
+    let base_url = match mode {
+        EndpointMode::Official => id.official_base_url().to_string(),
+        EndpointMode::Custom => provider_settings.custom_base_url.clone(),
+    };
+    let api_key = settings
+        .credentials()
+        .get(id, mode)
+        .map(str::to_string)
+        .with_context(|| format!("未配置 {} 的{}密钥", id.label(), mode.label()))?;
+
+    let report = crate::providers::probe(id, mode, &base_url, &api_key, "").await?;
+    if report.models.is_empty() {
+        println!("该端点没有返回模型列表（代理可能未实现 /models）");
+        return Ok(());
+    }
+
+    let filter = capability.map(|c| c.parse::<Capability>()).transpose()?;
+    println!("{} · {} — {} 个模型", id.label(), mode.label(), report.models.len());
+    for model in &report.models {
+        match filter {
+            Some(cap) if !crate::providers::looks_like(cap, model) => continue,
+            _ => println!("  {model}"),
+        }
+    }
+    if filter.is_some() {
+        println!();
+        println!("（按名称启发式筛选，未列出的也可以手动填写）");
     }
     Ok(())
 }

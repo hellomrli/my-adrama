@@ -325,12 +325,16 @@ pub async fn list_models(http: &Http, base: &str, key: &str) -> Result<Vec<Strin
                 .timeout(Duration::from_secs(25))
         })
         .await?;
+    // Gemini returns `models/gemini-2.0-flash`; config wants the bare id.
     Ok(value
         .get("models")
         .and_then(|m| m.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|v| v.as_str())?;
+                    Some(name.trim_start_matches("models/").to_string())
+                })
                 .collect()
         })
         .unwrap_or_default())

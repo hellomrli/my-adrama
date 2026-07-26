@@ -18,6 +18,8 @@ const CONSOLE_CAPACITY: usize = 600;
 pub enum View {
     Dashboard,
     Script,
+    /// 由 breakdown 推导出的依赖图。
+    Flow,
     Stage(Stage),
     Settings,
 }
@@ -27,6 +29,7 @@ impl View {
         match self {
             View::Dashboard => "概览",
             View::Script => "剧本",
+            View::Flow => "流程图",
             View::Stage(Stage::Parse) => "拆解",
             View::Stage(Stage::Assets) => "资产",
             View::Stage(Stage::Storyboard) => "分镜",
@@ -40,6 +43,7 @@ impl View {
         match self {
             View::Dashboard => "dashboard".into(),
             View::Script => "script".into(),
+            View::Flow => "flow".into(),
             View::Stage(stage) => format!("stage:{stage}"),
             View::Settings => "settings".into(),
         }
@@ -49,6 +53,7 @@ impl View {
         match key {
             "dashboard" => Some(View::Dashboard),
             "script" => Some(View::Script),
+            "flow" => Some(View::Flow),
             "settings" => Some(View::Settings),
             other => other
                 .strip_prefix("stage:")
@@ -61,6 +66,7 @@ impl View {
         match self {
             View::Dashboard => "项目状态与下一步操作",
             View::Script => "导入或直接编写剧本原文",
+            View::Flow => "这个项目接下来会做哪些事、彼此依赖关系如何",
             View::Stage(Stage::Parse) => "模型拆出的角色、场次与镜头表",
             View::Stage(Stage::Assets) => "角色定妆照与服化道参考图",
             View::Stage(Stage::Storyboard) => "逐镜头画面，复用资产保持一致性",
@@ -75,6 +81,41 @@ pub enum SettingsTab {
     Providers,
     Routing,
     Project,
+    About,
+}
+
+/// In-app updater state.
+pub struct UpdateState {
+    pub install: crate::update::InstallKind,
+    pub checking: bool,
+    pub last_result: Option<Result<crate::update::UpdateStatus, String>>,
+    /// `(已下载, 总量)` while a download is in flight.
+    pub download: Option<(u64, u64)>,
+    pub applied: Option<crate::update::Applied>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            install: crate::update::install_kind(),
+            checking: false,
+            last_result: None,
+            download: None,
+            applied: None,
+        }
+    }
+}
+
+impl UpdateState {
+    /// Version string when a newer release is known to exist.
+    pub fn available(&self) -> Option<&str> {
+        match &self.last_result {
+            Some(Ok(crate::update::UpdateStatus::Available(release))) => {
+                Some(release.version.as_str())
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +207,16 @@ pub struct AppState {
     pub keys_dirty: bool,
     pub revealed: HashMap<String, bool>,
 
+    /// 流程图的平移与缩放。
+    pub flow_pan: eframe::egui::Vec2,
+    pub flow_zoom: f32,
+    /// 下一帧把整张图缩放到刚好放得下。
+    pub flow_fit: bool,
+
     pub new_project: NewProjectForm,
     pub preview: Option<PathBuf>,
     pub dry_run: bool,
+    pub updates: UpdateState,
     /// Files a running job just wrote; the app drops their cached textures so
     /// a regenerated image appears immediately.
     pub dirty_thumbs: Vec<PathBuf>,
@@ -206,6 +254,9 @@ impl AppState {
             config_dirty: false,
             keys_dirty: false,
             revealed: HashMap::new(),
+            flow_pan: eframe::egui::Vec2::new(24.0, 16.0),
+            flow_zoom: 1.0,
+            flow_fit: true,
             new_project: NewProjectForm {
                 parent: std::env::current_dir().ok(),
                 name: "my-drama".into(),
@@ -214,6 +265,7 @@ impl AppState {
             },
             preview: None,
             dry_run,
+            updates: UpdateState::default(),
             dirty_thumbs: Vec::new(),
         }
     }
@@ -270,6 +322,68 @@ impl AppState {
             Update::ScanFailed(err) => self.fail(format!("读取项目失败：{err}")),
             Update::Outcome(Ok(outcome)) => self.apply_outcome(outcome),
             Update::Outcome(Err(err)) => self.fail(err),
+            Update::NewVersion(result) => {
+                self.updates.checking = false;
+                match &result {
+                    Ok(crate::update::UpdateStatus::Available(release)) => {
+                        self.note(format!("发现新版本 {}（设置 → 关于与更新）", release.version));
+                    }
+                    Ok(crate::update::UpdateStatus::UpToDate) => {
+                        self.push_console(Level::Info, "已是最新版本");
+                    }
+                    Err(err) => self.push_console(Level::Warn, format!("检查更新失败：{err}")),
+                }
+                self.updates.last_result = Some(result);
+                self.settings.mark_update_checked();
+                let _ = self.settings.save();
+            }
+            Update::DownloadProgress { received, total } => {
+                self.updates.download = Some((received, total));
+            }
+            Update::Installed(result) => {
+                self.updates.download = None;
+                match result {
+                    Ok(applied) => {
+                        self.note(format!("已更新到 {}，重启后生效", applied.version));
+                        self.updates.applied = Some(applied);
+                    }
+                    Err(err) => self.fail(format!("更新失败：{err}")),
+                }
+            }
+        }
+    }
+
+    // --- updater ------------------------------------------------------------
+
+    pub fn start_update_check(&mut self, runtime: &Runtime) {
+        if self.updates.checking {
+            return;
+        }
+        self.updates.checking = true;
+        runtime.check_update();
+    }
+
+    pub fn start_update_download(&mut self, runtime: &Runtime) {
+        let release = match &self.updates.last_result {
+            Some(Ok(crate::update::UpdateStatus::Available(release))) => (**release).clone(),
+            _ => return,
+        };
+        if self.updates.download.is_some() {
+            return;
+        }
+        self.updates.download = Some((0, 0));
+        self.push_console(Level::Info, format!("开始下载 {}", release.version));
+        runtime.apply_update(release);
+    }
+
+    /// Launch the freshly installed binary and close this window.
+    pub fn restart_after_update(&mut self, ctx: &eframe::egui::Context) {
+        let Some(applied) = &self.updates.applied else {
+            return;
+        };
+        match crate::update::restart(&applied.executable) {
+            Ok(()) => ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close),
+            Err(err) => self.fail(format!("重启失败：{err:#}")),
         }
     }
 
@@ -316,6 +430,23 @@ impl AppState {
     }
 
     fn apply_outcome(&mut self, outcome: JobOutcome) {
+        // A connectivity probe doubles as "fetch the model list".
+        if let Some(probed) = outcome.models {
+            let count = probed.models.len();
+            self.settings
+                .set_known_models(probed.provider, probed.mode, probed.models);
+            let _ = self.settings.save();
+            if count > 0 {
+                self.push_console(
+                    Level::Info,
+                    format!(
+                        "{} {} 可用模型 {count} 个，已写入下拉列表",
+                        probed.provider.label(),
+                        probed.mode.label()
+                    ),
+                );
+            }
+        }
         if let Some(detail) = outcome.detail {
             self.push_console(Level::Info, detail.clone());
             if let Some(banner) = &mut self.banner {

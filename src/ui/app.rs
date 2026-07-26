@@ -40,6 +40,11 @@ impl AdramaApp {
             state.view = restored;
         }
 
+        // 每天最多问一次 GitHub，失败也不打扰。
+        if state.settings.update_check_due() {
+            state.start_update_check(&runtime);
+        }
+
         Self {
             state,
             runtime,
@@ -86,6 +91,7 @@ impl eframe::App for AdramaApp {
                 match view {
                     View::Dashboard => views::dashboard::show(ui, &mut cx),
                     View::Script => views::script::show(ui, &mut cx),
+                    View::Flow => views::flow::show(ui, &mut cx),
                     View::Stage(Stage::Parse) => views::breakdown::show(ui, &mut cx),
                     View::Stage(stage) => views::workbench::show(ui, &mut cx, stage),
                     View::Settings => views::settings::show(ui, &mut cx),
@@ -144,6 +150,8 @@ impl AdramaApp {
                         self.state.refresh(&self.runtime);
                     }
 
+                    self.update_badge(ui);
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.busy_indicator(ui);
                     });
@@ -151,6 +159,21 @@ impl AdramaApp {
             });
 
         self.banner(ctx);
+    }
+
+    /// 有新版本时在顶栏挂一个可点的徽标。
+    fn update_badge(&mut self, ui: &mut egui::Ui) {
+        let Some(version) = self.state.updates.available().map(str::to_string) else {
+            return;
+        };
+        let clicked = widgets::pill(ui, &format!("有新版本 {version}"), theme::WARNING)
+            .interact(egui::Sense::click())
+            .on_hover_text("点击查看更新说明并安装")
+            .clicked();
+        if clicked {
+            self.state.view = View::Settings;
+            self.state.settings_tab = super::state::SettingsTab::About;
+        }
     }
 
     fn busy_indicator(&mut self, ui: &mut egui::Ui) {
@@ -261,6 +284,7 @@ impl AdramaApp {
             .show(ctx, |ui| {
                 self.nav_item(ui, View::Dashboard, "概览", None);
                 self.nav_item(ui, View::Script, "剧本", None);
+                self.nav_item(ui, View::Flow, "流程图", None);
 
                 ui.add_space(theme::SPACE_MD);
                 widgets::hint(ui, "生产阶段");

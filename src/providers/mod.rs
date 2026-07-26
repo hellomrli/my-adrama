@@ -253,6 +253,30 @@ impl<'a> ProviderFactory<'a> {
 pub struct ProbeReport {
     pub summary: String,
     pub detail: String,
+    /// Model ids the endpoint reports. Empty when a proxy does not implement
+    /// `/models` — the UI then falls back to free-text entry.
+    pub models: Vec<String>,
+}
+
+/// Heuristic: does this model id look like it serves `cap`? Used only to sort
+/// the picker, never to hide a model — vendors rename things constantly.
+pub fn looks_like(cap: Capability, model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let image = ["image", "imagen", "dall-e", "dalle", "flux", "sd-", "stable"];
+    let video = ["veo", "video", "sora", "kling", "runway"];
+    match cap {
+        Capability::Image => image.iter().any(|k| m.contains(k)),
+        Capability::Video => video.iter().any(|k| m.contains(k)),
+        Capability::Chat => {
+            !image.iter().any(|k| m.contains(k))
+                && !video.iter().any(|k| m.contains(k))
+                && !m.contains("embedding")
+                && !m.contains("whisper")
+                && !m.contains("tts")
+                && !m.contains("moderation")
+                && !m.contains("rerank")
+        }
+    }
 }
 
 /// Verify a key/endpoint pair without spending generation credits.
@@ -281,20 +305,31 @@ pub async fn probe(
     }?;
 
     let mut detail = format!("端点 {base}\n密钥 {}", http::mask(key));
-    if !models.is_empty() {
-        detail.push_str(&format!("\n可见模型 {} 个", models.len()));
+    if models.is_empty() {
+        detail.push_str("\n该端点未返回模型列表（代理可能未实现 /models），模型 ID 需手动填写");
+    } else {
+        detail.push_str(&format!("\n拉取到 {} 个模型，可在下方下拉框中选择", models.len()));
         if !model.trim().is_empty() {
-            let known = models.iter().any(|m| m.contains(model.trim()));
+            let known = models.iter().any(|m| m == model.trim());
             detail.push_str(&format!(
-                "\n配置模型 {model} {}",
-                if known { "✓ 在列表中" } else { "· 未在列表中（代理可能不返回全部模型）" }
+                "\n当前配置 {model} {}",
+                if known {
+                    "✓ 在列表中"
+                } else {
+                    "· 不在列表中（可能已下线或代理未列出）"
+                }
             ));
         }
     }
 
     Ok(ProbeReport {
-        summary: format!("{label} 连接正常"),
+        summary: if models.is_empty() {
+            format!("{label} 连接正常")
+        } else {
+            format!("{label} 连接正常 · {} 个模型", models.len())
+        },
         detail,
+        models,
     })
 }
 

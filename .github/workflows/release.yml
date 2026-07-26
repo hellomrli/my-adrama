@@ -87,6 +87,9 @@ jobs:
             cp -v "$f" release-assets/adrama-linux-x86_64
             chmod +x release-assets/adrama-linux-x86_64
           done < <(find artifacts -type f -name adrama ! -path '*.deb')
+          # 校验和随 release 一起发布：应用内更新会用它验证下载的二进制
+          (cd release-assets && sha256sum -- * > ../SHA256SUMS.txt) && mv SHA256SUMS.txt release-assets/
+          cat release-assets/SHA256SUMS.txt
           ls -lah release-assets
           test -f release-assets/adrama.exe
           test -n "$(ls release-assets/*.deb 2>/dev/null)"
@@ -113,6 +116,7 @@ jobs:
           - **Windows**: \`adrama.exe\` / \`adrama-windows-x86_64.zip\`
           - **Linux deb**: \`*.deb\` (install with \`sudo dpkg -i …\`)
           - **Linux binary**: \`adrama-linux-x86_64\`
+          - **Checksums**: \`SHA256SUMS.txt\`
 
           GUI opens with no args. CLI: \`adrama --help\`
           "

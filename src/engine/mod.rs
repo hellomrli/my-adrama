@@ -51,6 +51,15 @@ pub struct JobRequest {
     pub credentials: Credentials,
 }
 
+/// Model ids a connectivity probe discovered, so the UI can offer a picker
+/// instead of making the user type an id that may have been renamed upstream.
+#[derive(Debug, Clone)]
+pub struct ProbedModels {
+    pub provider: ProviderId,
+    pub mode: EndpointMode,
+    pub models: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobOutcome {
     pub message: String,
@@ -58,6 +67,8 @@ pub struct JobOutcome {
     pub detail: Option<String>,
     /// Stage whose state may have changed, so the UI knows to refresh.
     pub stage: Option<Stage>,
+    /// Set by `Job::Probe`.
+    pub models: Option<ProbedModels>,
 }
 
 impl JobOutcome {
@@ -66,6 +77,7 @@ impl JobOutcome {
             message: message.into(),
             detail: None,
             stage: None,
+            models: None,
         }
     }
 
@@ -157,7 +169,13 @@ pub async fn execute(req: JobRequest, ctx: &JobContext) -> Result<JobOutcome> {
     if let Job::Probe(p) = &job {
         let report = providers::probe(p.provider, p.mode, &p.base_url, &p.api_key, &p.model).await?;
         ctx.info(report.detail.clone());
-        return Ok(JobOutcome::msg(report.summary).detail(report.detail));
+        let mut outcome = JobOutcome::msg(report.summary).detail(report.detail);
+        outcome.models = Some(ProbedModels {
+            provider: p.provider,
+            mode: p.mode,
+            models: report.models,
+        });
+        return Ok(outcome);
     }
 
     let mut project = Project::open(&root)?;

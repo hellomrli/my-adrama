@@ -23,6 +23,9 @@ pub struct AppSettings {
     pub recent_projects: Vec<PathBuf>,
     #[serde(default)]
     pub ui: UiPrefs,
+    /// `"openai.official"` → 上次拉取到的模型 ID 列表。
+    #[serde(default)]
+    pub model_cache: BTreeMap<String, Vec<String>>,
 
     // --- legacy 0.1.x fields, migrated on load then dropped on save ---
     #[serde(default, skip_serializing)]
@@ -59,6 +62,12 @@ pub struct UiPrefs {
     /// Screen to reopen on launch.
     #[serde(default)]
     pub last_view: Option<String>,
+    /// Check GitHub for a newer release on startup (once a day).
+    #[serde(default = "yes")]
+    pub auto_check_updates: bool,
+    /// Unix seconds of the last check, so we do not ask on every launch.
+    #[serde(default)]
+    pub last_update_check: u64,
 }
 
 fn yes() -> bool {
@@ -76,6 +85,8 @@ impl Default for UiPrefs {
             thumbnail_size: default_thumb(),
             dry_run: false,
             last_view: None,
+            auto_check_updates: true,
+            last_update_check: 0,
         }
     }
 }
@@ -154,6 +165,22 @@ impl AppSettings {
 
     /// Credentials for a job: stored keys, with environment variables filling
     /// any gaps (so `OPENAI_API_KEY=… adrama parse` still works).
+    /// Model ids last fetched from this endpoint.
+    pub fn known_models(&self, id: ProviderId, mode: EndpointMode) -> &[String] {
+        self.model_cache
+            .get(&slot(id, mode))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn set_known_models(&mut self, id: ProviderId, mode: EndpointMode, models: Vec<String>) {
+        if models.is_empty() {
+            self.model_cache.remove(&slot(id, mode));
+        } else {
+            self.model_cache.insert(slot(id, mode), models);
+        }
+    }
+
     pub fn credentials(&self) -> Credentials {
         let mut creds = Credentials::default();
         for id in ProviderId::ALL {
@@ -175,12 +202,31 @@ impl AppSettings {
         self.recent_projects.truncate(12);
     }
 
+    /// Should we look for a new release now?
+    pub fn update_check_due(&self) -> bool {
+        if !self.ui.auto_check_updates {
+            return false;
+        }
+        now_secs().saturating_sub(self.ui.last_update_check) >= crate::update::CHECK_INTERVAL.as_secs()
+    }
+
+    pub fn mark_update_checked(&mut self) {
+        self.ui.last_update_check = now_secs();
+    }
+
     pub fn forget_project(&mut self, path: &PathBuf) {
         self.recent_projects.retain(|p| p != path);
         if self.last_project.as_ref() == Some(path) {
             self.last_project = None;
         }
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn slot(id: ProviderId, mode: EndpointMode) -> String {

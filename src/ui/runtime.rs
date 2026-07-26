@@ -59,6 +59,8 @@ impl Snapshot {
 enum Request {
     Job(Box<JobRequest>),
     Scan(PathBuf),
+    CheckUpdate,
+    ApplyUpdate(Box<crate::update::ReleaseInfo>),
     Shutdown,
 }
 
@@ -68,6 +70,10 @@ pub enum Update {
     Snapshot(Box<Snapshot>),
     ScanFailed(String),
     Outcome(Result<JobOutcome, String>),
+    /// Result of an update check.
+    NewVersion(Result<crate::update::UpdateStatus, String>),
+    DownloadProgress { received: u64, total: u64 },
+    Installed(Result<crate::update::Applied, String>),
 }
 
 pub struct Runtime {
@@ -108,6 +114,16 @@ impl Runtime {
     /// Ask the worker to re-read the project from disk.
     pub fn scan(&self, root: PathBuf) {
         let _ = self.tx.send(Request::Scan(root));
+    }
+
+    /// Ask GitHub whether a newer release exists.
+    pub fn check_update(&self) {
+        let _ = self.tx.send(Request::CheckUpdate);
+    }
+
+    /// Download and install the given release.
+    pub fn apply_update(&self, release: crate::update::ReleaseInfo) {
+        let _ = self.tx.send(Request::ApplyUpdate(Box::new(release)));
     }
 
     pub fn cancel(&self) {
@@ -160,6 +176,25 @@ fn worker(
             Request::Shutdown => break,
             Request::Scan(root) => {
                 send_snapshot(&updates, &ctx, &root);
+            }
+            Request::CheckUpdate => {
+                let result = rt
+                    .block_on(crate::update::check())
+                    .map_err(|e| format!("{e:#}"));
+                let _ = updates.send(Update::NewVersion(result));
+                ctx.request_repaint();
+            }
+            Request::ApplyUpdate(release) => {
+                let progress_tx = updates.clone();
+                let progress_ctx = ctx.clone();
+                let result = rt
+                    .block_on(crate::update::download_and_apply(&release, |received, total| {
+                        let _ = progress_tx.send(Update::DownloadProgress { received, total });
+                        progress_ctx.request_repaint();
+                    }))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = updates.send(Update::Installed(result));
+                ctx.request_repaint();
             }
             Request::Job(req) => {
                 let root = req.root.clone();

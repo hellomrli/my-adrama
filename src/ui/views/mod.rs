@@ -3,6 +3,7 @@
 
 pub mod breakdown;
 pub mod dashboard;
+pub mod flow;
 pub mod script;
 pub mod settings;
 pub mod workbench;

@@ -1,6 +1,6 @@
 [package]
 name = "adrama"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "AI short-drama production workflow (GUI + CLI)"
 license = "MIT"
@@ -22,6 +22,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rfd = "0.15"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

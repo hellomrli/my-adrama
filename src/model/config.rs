@@ -153,6 +153,19 @@ impl fmt::Display for Capability {
     }
 }
 
+impl FromStr for Capability {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chat" | "text" | "对话" => Ok(Capability::Chat),
+            "image" | "img" | "图像" => Ok(Capability::Image),
+            "video" | "视频" => Ok(Capability::Video),
+            other => bail!("未知能力：{other}（可选 chat / image / video）"),
+        }
+    }
+}
+
 /// Official cloud endpoint vs. a user-supplied proxy / self-hosted gateway.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,

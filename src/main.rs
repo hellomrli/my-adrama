@@ -10,6 +10,7 @@ mod model;
 mod providers;
 mod settings;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use clap::Parser;
@@ -34,6 +35,8 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     // `.env` is a convenience for CLI users; keys are read (never written) here.
     dotenvy::dotenv().ok();
+    // Remove backups left by a previous self-update (Windows keeps `.old`).
+    update::cleanup_leftovers();
 
     let args = Cli::parse();
     let launch_gui = args.gui || matches!(args.command, None | Some(Command::Gui));

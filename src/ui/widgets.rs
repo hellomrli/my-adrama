@@ -207,7 +207,12 @@ pub fn shorten_path(text: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
-/// Open a file or folder with the desktop's default handler.
+/// Open a URL in the default browser.
+pub fn open_url(url: &str) {
+    open_path(Path::new(url));
+}
+
+/// Open a file, folder or URL with the desktop's default handler.
 pub fn open_path(path: &Path) {
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("cmd")

@@ -1,15 +1,16 @@
-//! Settings: provider credentials, capability routing, project parameters.
+//! Settings: provider credentials, capability routing, project parameters,
+//! and the in-app updater.
 
 use eframe::egui::{self, RichText, Ui};
 
 use super::ViewCtx;
 use crate::engine::{Job, ProbeRequest};
-use crate::model::{
-    AspectRatio, Capability, EndpointMode, ProviderId,
-};
+use crate::model::{AspectRatio, Capability, EndpointMode, ProviderId};
+use crate::providers::looks_like;
 use crate::settings::AppSettings;
 use crate::ui::state::{SettingsTab, View};
 use crate::ui::{theme, widgets};
+use crate::update::{self, UpdateStatus};
 
 pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     widgets::page_header(ui, View::Settings.title(), View::Settings.subtitle());
@@ -19,6 +20,7 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             (SettingsTab::Providers, "服务商与密钥"),
             (SettingsTab::Routing, "能力路由"),
             (SettingsTab::Project, "项目参数"),
+            (SettingsTab::About, "关于与更新"),
         ] {
             if ui
                 .selectable_label(cx.state.settings_tab == tab, label)
@@ -42,8 +44,13 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
             SettingsTab::Providers => providers(ui, cx),
             SettingsTab::Routing => routing(ui, cx),
             SettingsTab::Project => project(ui, cx),
+            SettingsTab::About => about(ui, cx),
         });
 }
+
+// ---------------------------------------------------------------------------
+// 服务商与密钥
+// ---------------------------------------------------------------------------
 
 fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let busy = cx.state.is_busy();
@@ -57,11 +64,12 @@ fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                 ui.label(RichText::new(id.tagline()).small().color(theme::TEXT_MUTED));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for cap in Capability::ALL.into_iter().rev() {
-                        if id.supports(cap) {
-                            widgets::pill(ui, cap.label(), theme::SUCCESS);
+                        let color = if id.supports(cap) {
+                            theme::SUCCESS
                         } else {
-                            widgets::pill(ui, cap.label(), theme::TEXT_DIM);
-                        }
+                            theme::TEXT_DIM
+                        };
+                        widgets::pill(ui, cap.label(), color);
                     }
                 });
             });
@@ -79,26 +87,14 @@ fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                 }
             });
 
-            // Official credentials
+            // --- 官方端点 ---
             ui.add_space(theme::SPACE_SM);
             widgets::hint(ui, &format!("官方地址 {}", id.official_base_url()));
-            widgets::field_row(ui, "官方密钥", 84.0, |ui| {
-                let mut key = cx.state.settings.key(id, EndpointMode::Official).to_string();
-                let reveal_key = format!("{id}.official");
-                let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
-                if widgets::secret_field(ui, &mut key, &mut revealed, 280.0, "sk-… / AIza…") {
-                    cx.state
-                        .settings
-                        .set_key(id, EndpointMode::Official, key.clone());
-                    cx.state.keys_dirty = true;
-                }
-                cx.state.revealed.insert(reveal_key, revealed);
-                if widgets::button(ui, "测试", !busy && !key.trim().is_empty()) {
-                    probe = Some((id, EndpointMode::Official));
-                }
-            });
+            if key_row(ui, cx, id, EndpointMode::Official, busy, "sk-… / AIza…") {
+                probe = Some((id, EndpointMode::Official));
+            }
 
-            // Custom endpoint
+            // --- 自定义端点 ---
             ui.add_space(theme::SPACE_SM);
             widgets::field_row(ui, "自定义地址", 84.0, |ui| {
                 let settings = cx.state.config_draft.provider_mut(id);
@@ -111,48 +107,22 @@ fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
                     cx.state.config_dirty = true;
                 }
             });
-            widgets::field_row(ui, "自定义密钥", 84.0, |ui| {
-                let mut key = cx.state.settings.key(id, EndpointMode::Custom).to_string();
-                let reveal_key = format!("{id}.custom");
-                let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
-                if widgets::secret_field(ui, &mut key, &mut revealed, 280.0, "代理 / 自建服务密钥") {
-                    cx.state
-                        .settings
-                        .set_key(id, EndpointMode::Custom, key.clone());
-                    cx.state.keys_dirty = true;
-                }
-                cx.state.revealed.insert(reveal_key, revealed);
-                let can_test = !busy
-                    && !key.trim().is_empty()
-                    && !cx
-                        .state
-                        .config_draft
-                        .provider(id)
-                        .custom_base_url
-                        .trim()
-                        .is_empty();
-                if widgets::button(ui, "测试", can_test) {
-                    probe = Some((id, EndpointMode::Custom));
-                }
-            });
+            let custom_ready = !cx
+                .state
+                .config_draft
+                .provider(id)
+                .custom_base_url
+                .trim()
+                .is_empty();
+            if key_row(ui, cx, id, EndpointMode::Custom, busy && custom_ready, "代理 / 自建服务密钥")
+                && custom_ready
+            {
+                probe = Some((id, EndpointMode::Custom));
+            }
 
-            // Models per supported capability
+            // --- 模型 ---
             ui.add_space(theme::SPACE_SM);
-            egui::CollapsingHeader::new(RichText::new("模型 ID").small())
-                .id_salt(("models", id))
-                .show(ui, |ui| {
-                    for cap in Capability::ALL {
-                        if !id.supports(cap) {
-                            continue;
-                        }
-                        widgets::field_row(ui, cap.label(), 84.0, |ui| {
-                            let settings = cx.state.config_draft.provider_mut(id);
-                            if widgets::text_field(ui, settings.model_for_mut(cap), 260.0, "") {
-                                cx.state.config_dirty = true;
-                            }
-                        });
-                    }
-                });
+            models_section(ui, cx, id);
         });
         ui.add_space(theme::SPACE_SM);
     }
@@ -160,24 +130,148 @@ fn providers(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     save_bar(ui, cx);
 
     if let Some((id, mode)) = probe {
-        let key = cx.state.settings.key(id, mode).to_string();
-        let settings = cx.state.config_draft.provider(id).clone();
-        let base_url = match mode {
-            EndpointMode::Official => id.official_base_url().to_string(),
-            EndpointMode::Custom => settings.custom_base_url.clone(),
-        };
-        cx.state.submit_probe(
-            cx.runtime,
-            Job::Probe(ProbeRequest {
-                provider: id,
-                mode,
-                base_url,
-                api_key: key,
-                model: settings.chat_model.clone(),
-            }),
-        );
+        launch_probe(cx, id, mode);
     }
 }
+
+/// 一行密钥输入 + 显示/隐藏 + 测试按钮。返回是否点了测试。
+fn key_row(
+    ui: &mut Ui,
+    cx: &mut ViewCtx<'_>,
+    id: ProviderId,
+    mode: EndpointMode,
+    busy: bool,
+    hint: &str,
+) -> bool {
+    let mut test = false;
+    let label = format!("{}密钥", mode.label());
+    widgets::field_row(ui, &label, 84.0, |ui| {
+        let mut key = cx.state.settings.key(id, mode).to_string();
+        let reveal_key = format!("{id}.{}", mode.label());
+        let mut revealed = *cx.state.revealed.get(&reveal_key).unwrap_or(&false);
+        if widgets::secret_field(ui, &mut key, &mut revealed, 280.0, hint) {
+            cx.state.settings.set_key(id, mode, key.clone());
+            cx.state.keys_dirty = true;
+        }
+        cx.state.revealed.insert(reveal_key, revealed);
+
+        if ui
+            .add_enabled(
+                !busy && !key.trim().is_empty(),
+                egui::Button::new("测试并拉取模型"),
+            )
+            .on_hover_text("验证密钥是否可用，并把上游当前提供的模型列表拉下来")
+            .clicked()
+        {
+            test = true;
+        }
+
+        let cached = cx.state.settings.known_models(id, mode).len();
+        if cached > 0 {
+            widgets::hint(ui, &format!("已缓存 {cached} 个模型"));
+        }
+    });
+    test
+}
+
+fn launch_probe(cx: &mut ViewCtx<'_>, id: ProviderId, mode: EndpointMode) {
+    let key = cx.state.settings.key(id, mode).to_string();
+    let settings = cx.state.config_draft.provider(id).clone();
+    let base_url = match mode {
+        EndpointMode::Official => id.official_base_url().to_string(),
+        EndpointMode::Custom => settings.custom_base_url.clone(),
+    };
+    cx.state.submit_probe(
+        cx.runtime,
+        Job::Probe(ProbeRequest {
+            provider: id,
+            mode,
+            base_url,
+            api_key: key,
+            model: settings.chat_model.clone(),
+        }),
+    );
+}
+
+/// 每个能力一行：可直接输入，也可从拉取到的模型列表里选。
+fn models_section(ui: &mut Ui, cx: &mut ViewCtx<'_>, id: ProviderId) {
+    let mode = cx.state.config_draft.provider(id).mode;
+    let known: Vec<String> = cx.state.settings.known_models(id, mode).to_vec();
+
+    egui::CollapsingHeader::new(RichText::new("模型 ID").small())
+        .id_salt(("models", id))
+        .default_open(true)
+        .show(ui, |ui| {
+            if known.is_empty() {
+                widgets::hint(
+                    ui,
+                    "点上方「测试并拉取模型」后，这里会出现可选模型；也可以直接手填。",
+                );
+            }
+            for cap in Capability::ALL {
+                if !id.supports(cap) {
+                    continue;
+                }
+                widgets::field_row(ui, cap.label(), 84.0, |ui| {
+                    let current = cx.state.config_draft.provider(id).model_for(cap).to_string();
+
+                    let settings = cx.state.config_draft.provider_mut(id);
+                    if widgets::text_field(ui, settings.model_for_mut(cap), 240.0, "模型 ID") {
+                        cx.state.config_dirty = true;
+                    }
+
+                    if known.is_empty() {
+                        return;
+                    }
+                    // 相关的排在前面，但不隐藏其它——厂商命名经常变。
+                    let (likely, others): (Vec<&String>, Vec<&String>) =
+                        known.iter().partition(|m| looks_like(cap, m));
+
+                    let mut picked: Option<String> = None;
+                    egui::ComboBox::from_id_salt(("pick", id, cap))
+                        .selected_text("从列表选择")
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                for model in &likely {
+                                    if ui
+                                        .selectable_label(**model == current, *model)
+                                        .clicked()
+                                    {
+                                        picked = Some((*model).clone());
+                                    }
+                                }
+                                if !others.is_empty() {
+                                    ui.separator();
+                                    widgets::hint(ui, "其它模型");
+                                    for model in &others {
+                                        if ui
+                                            .selectable_label(**model == current, *model)
+                                            .clicked()
+                                        {
+                                            picked = Some((*model).clone());
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                    if let Some(model) = picked {
+                        *cx.state.config_draft.provider_mut(id).model_for_mut(cap) = model;
+                        cx.state.config_dirty = true;
+                    }
+
+                    if !current.trim().is_empty() && !known.iter().any(|m| m == &current) {
+                        widgets::pill(ui, "不在列表中", theme::WARNING);
+                    }
+                });
+            }
+        });
+}
+
+// ---------------------------------------------------------------------------
+// 能力路由
+// ---------------------------------------------------------------------------
 
 fn routing(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let credentials = cx.state.credentials();
@@ -237,6 +331,10 @@ fn routing(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     ui.add_space(theme::SPACE_SM);
     save_bar(ui, cx);
 }
+
+// ---------------------------------------------------------------------------
+// 项目参数
+// ---------------------------------------------------------------------------
 
 fn project(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     if cx.state.snapshot.is_none() {
@@ -316,6 +414,175 @@ fn project(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     save_bar(ui, cx);
 }
 
+// ---------------------------------------------------------------------------
+// 关于与更新
+// ---------------------------------------------------------------------------
+
+fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
+    let checking = cx.state.updates.checking;
+    let downloading = cx.state.updates.download;
+    let can_self_update = cx.state.updates.install.can_self_update();
+    let install_desc = cx.state.updates.install.describe();
+
+    let mut do_check = false;
+    let mut do_apply = false;
+    let mut do_restart = false;
+    let mut open_page: Option<String> = None;
+
+    theme::card().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            widgets::section_title(ui, "adrama");
+            widgets::pill(ui, update::CURRENT_VERSION, theme::ACCENT);
+        });
+        widgets::hint(ui, &install_desc);
+        ui.add_space(theme::SPACE_SM);
+
+        ui.horizontal_wrapped(|ui| {
+            if widgets::primary_button(ui, "检查更新", !checking && downloading.is_none()) {
+                do_check = true;
+            }
+            if checking {
+                ui.spinner();
+                widgets::hint(ui, "正在查询 GitHub…");
+            }
+            let mut auto = cx.state.settings.ui.auto_check_updates;
+            if ui.checkbox(&mut auto, "启动时自动检查").changed() {
+                cx.state.settings.ui.auto_check_updates = auto;
+                let _ = cx.state.settings.save();
+            }
+            if widgets::button(ui, "打开发布页", true) {
+                open_page = Some(format!("https://github.com/{}/releases", update::REPO));
+            }
+        });
+
+        // 下载进度
+        if let Some((received, total)) = downloading {
+            ui.add_space(theme::SPACE_SM);
+            let ratio = if total > 0 {
+                received as f32 / total as f32
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(ratio)
+                    .desired_width(320.0)
+                    .text(format!("{} / {}", human_size(received), human_size(total))),
+            );
+        }
+
+        // 已完成
+        if let Some(applied) = &cx.state.updates.applied {
+            ui.add_space(theme::SPACE_SM);
+            theme::inset().show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("已更新到 {}，重启后生效", applied.version))
+                        .color(theme::SUCCESS),
+                );
+                widgets::hint(
+                    ui,
+                    if applied.verified {
+                        "已通过 SHA-256 校验"
+                    } else {
+                        "该 release 未提供校验和文件，仅依赖 HTTPS"
+                    },
+                );
+                if widgets::primary_button(ui, "立即重启", true) {
+                    do_restart = true;
+                }
+            });
+        }
+
+        // 检查结果
+        ui.add_space(theme::SPACE_SM);
+        match &cx.state.updates.last_result {
+            None => widgets::hint(ui, "还没有检查过更新。"),
+            Some(Err(err)) => {
+                ui.label(RichText::new(format!("检查失败：{err}")).color(theme::DANGER));
+            }
+            Some(Ok(UpdateStatus::UpToDate)) => {
+                ui.label(
+                    RichText::new(format!("已是最新版本（{}）", update::CURRENT_VERSION))
+                        .color(theme::SUCCESS),
+                );
+            }
+            Some(Ok(UpdateStatus::Available(release))) => {
+                let has_asset = release.asset_for_platform().is_some();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("发现新版本 {}", release.version))
+                            .strong()
+                            .color(theme::WARNING),
+                    );
+                    widgets::pill(ui, &release.tag, theme::WARNING);
+                });
+
+                if !release.notes.trim().is_empty() {
+                    ui.add_space(theme::SPACE_XS);
+                    theme::inset().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .id_salt("release_notes")
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(&release.notes)
+                                        .small()
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            });
+                    });
+                }
+
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal_wrapped(|ui| {
+                    if can_self_update && has_asset {
+                        if widgets::primary_button(
+                            ui,
+                            "下载并安装",
+                            downloading.is_none() && cx.state.updates.applied.is_none(),
+                        ) {
+                            do_apply = true;
+                        }
+                    } else if !has_asset {
+                        widgets::hint(
+                            ui,
+                            &format!("该版本没有当前平台的产物（{}）", update::platform_asset_name()),
+                        );
+                    } else {
+                        widgets::hint(ui, "此副本由包管理器安装，请用 apt / dpkg 更新");
+                    }
+                    if widgets::button(ui, "查看发布页", true) {
+                        open_page = Some(release.page_url.clone());
+                    }
+                });
+            }
+        }
+    });
+
+    if do_check {
+        cx.state.start_update_check(cx.runtime);
+    }
+    if do_apply {
+        cx.state.start_update_download(cx.runtime);
+    }
+    if do_restart {
+        cx.state.restart_after_update(ui.ctx());
+    }
+    if let Some(url) = open_page {
+        widgets::open_url(&url);
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 fn save_bar(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     let keys_dirty = cx.state.keys_dirty;
     let config_dirty = cx.state.config_dirty;
@@ -375,3 +642,4 @@ fn provider_color(id: ProviderId) -> egui::Color32 {
         ProviderId::Xai => theme::WARNING,
     }
 }
+
