@@ -22,13 +22,6 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            ItemKind::Asset(k) => k.label(),
-            ItemKind::Storyboard => "分镜",
-            ItemKind::Video => "片段",
-        }
-    }
 }
 
 /// One reviewable unit of generated work.

@@ -37,8 +37,6 @@ pub const SPACE_SM: f32 = 8.0;
 pub const SPACE_MD: f32 = 12.0;
 pub const SPACE_LG: f32 = 18.0;
 
-pub const SPACE_XL: f32 = 26.0;
-
 pub const RADIUS_SM: f32 = 6.0;
 pub const RADIUS_MD: f32 = 10.0;
 pub const RADIUS_LG: f32 = 14.0;
