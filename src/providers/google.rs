@@ -172,14 +172,52 @@ impl ChatProvider for GoogleClient {
                     "responseSchema": to_gemini_schema(req.schema),
                 }
             });
-            let value = self.generate_content(body).await?;
 
-            let text: String = collect_parts(&value)
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
-                .collect();
+            // 流式：拆解长剧本经常要一两分钟，非流式会被网关判成超时（524）。
+            let url = format!("{}?alt=sse", self.model_url("streamGenerateContent"));
+            let text = self
+                .http
+                .send_sse(
+                    "Gemini 对话请求",
+                    || {
+                        self.http
+                            .client()
+                            .post(&url)
+                            .header(API_KEY_HEADER, &self.api_key)
+                            .json(&body)
+                    },
+                    |chunk| {
+                        let parts = collect_parts(chunk);
+                        let joined: String = parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                            .collect();
+                        (!joined.is_empty()).then_some(joined)
+                    },
+                )
+                .await?;
+
+            // 上游忽略 alt=sse 时返回整包 JSON（可能是数组），照样解析。
+            let text = match serde_json::from_str::<Value>(&text) {
+                Ok(value) if value.get("candidates").is_some() => collect_parts(&value)
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                    .collect(),
+                Ok(Value::Array(items)) => items
+                    .iter()
+                    .flat_map(|item| {
+                        collect_parts(item)
+                            .into_iter()
+                            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+                _ => text,
+            };
+
             if text.trim().is_empty() {
-                bail!("Gemini 未返回文本内容：{}", preview(&value.to_string()));
+                bail!("Gemini 未返回文本内容");
             }
             let cleaned = super::openai::strip_code_fences(&text);
             serde_json::from_str(cleaned)

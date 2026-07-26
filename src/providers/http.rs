@@ -7,6 +7,28 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::warn;
 
+/// 带状态码的失败，调用方据此判断「换个方式重来」还是「直接放弃」。
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl HttpError {
+    /// 上游明确拒绝了这个请求体（而不是超时/网关故障）。
+    pub fn is_client_rejection(&self) -> bool {
+        matches!(self.status, Some(400 | 404 | 415 | 422 | 501))
+    }
+}
+
 #[derive(Clone)]
 pub struct Http {
     client: Client,
@@ -48,7 +70,10 @@ impl Http {
                 Ok(body) => return Ok(body),
                 Err(err) => {
                     if !err.retryable || attempt >= self.retries {
-                        bail!("{label} 失败：{}", err.message);
+                        return Err(anyhow::Error::new(HttpError {
+                            status: err.status,
+                            message: format!("{label} 失败：{}", err.message),
+                        }));
                     }
                     let delay = Duration::from_secs(2u64.pow(attempt.min(4)));
                     warn!(
@@ -67,26 +92,30 @@ impl Http {
         loop {
             attempt += 1;
             let result = async {
-                let resp = make().send().await.map_err(|e| Attempt {
-                    retryable: e.is_timeout() || e.is_connect() || e.is_request(),
-                    message: self.redact(&format!("{e}")),
+                let resp = make().send().await.map_err(|e| {
+                    Attempt::transport(
+                        None,
+                        e.is_timeout() || e.is_connect() || e.is_request(),
+                        self.redact(&format!("{e}")),
+                    )
                 })?;
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(Attempt {
-                        retryable: is_retryable_status(status),
-                        message: format!(
+                    return Err(Attempt::transport(
+                        Some(status.as_u16()),
+                        is_retryable_status(status),
+                        format!(
                             "HTTP {status}{} — {}",
-                            auth_hint(status),
+                            status_hint(status),
                             self.redact(&preview(&body))
                         ),
-                    });
+                    ));
                 }
-                resp.bytes().await.map(|b| b.to_vec()).map_err(|e| Attempt {
-                    retryable: true,
-                    message: self.redact(&format!("{e}")),
-                })
+                resp.bytes()
+                    .await
+                    .map(|b| b.to_vec())
+                    .map_err(|e| Attempt::transport(None, true, self.redact(&format!("{e}"))))
             }
             .await;
 
@@ -102,6 +131,114 @@ impl Http {
         }
     }
 
+    /// 流式请求（SSE）。
+    ///
+    /// 长响应走非流式时，网关（尤其是 Cloudflare，100 秒）会在上游还没算完时
+    /// 判定超时并返回 524。流式下字节持续到达，连接不会空闲，也能顺带看到
+    /// 生成进度。`extract` 从每个 data 分片里取出增量文本。
+    ///
+    /// 若上游忽略了 `stream`（有些代理如此），会退回按整包 JSON 解析。
+    pub async fn send_sse(
+        &self,
+        label: &str,
+        make: impl Fn() -> RequestBuilder,
+        extract: impl Fn(&Value) -> Option<String>,
+    ) -> Result<String> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.stream_once(&make, &extract).await {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    if !err.retryable || attempt >= self.retries {
+                        return Err(anyhow::Error::new(HttpError {
+                            status: err.status,
+                            message: format!("{label} 失败：{}", err.message),
+                        }));
+                    }
+                    let delay = Duration::from_secs(2u64.pow(attempt.min(4)));
+                    warn!(
+                        "{label} 第 {attempt}/{} 次失败：{}；{delay:?} 后重试",
+                        self.retries, err.message
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn stream_once(
+        &self,
+        make: &impl Fn() -> RequestBuilder,
+        extract: &impl Fn(&Value) -> Option<String>,
+    ) -> std::result::Result<String, Attempt> {
+        let mut response = make().send().await.map_err(|e| {
+            Attempt::transport(
+                None,
+                e.is_timeout() || e.is_connect() || e.is_request(),
+                self.redact(&format!("{e}")),
+            )
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Attempt::transport(
+                Some(status.as_u16()),
+                is_retryable_status(status),
+                format!(
+                    "HTTP {status}{} — {}",
+                    status_hint(status),
+                    self.redact(&preview(&body))
+                ),
+            ));
+        }
+
+        let mut pending: Vec<u8> = Vec::new();
+        let mut raw: Vec<u8> = Vec::new();
+        let mut text = String::new();
+
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            // 已经收到内容还断开：重试会重复计费，也拿不到前半段，直接报错。
+            Attempt::transport(None, text.is_empty(), self.redact(&format!("{e}")))
+        })? {
+            raw.extend_from_slice(&chunk);
+            pending.extend_from_slice(&chunk);
+            // 按行切分：SSE 每行完整，不会切断多字节字符。
+            while let Some(eol) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=eol).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim_end().strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    if let Some(delta) = extract(&value) {
+                        text.push_str(&delta);
+                    }
+                }
+            }
+        }
+
+        if !text.is_empty() {
+            return Ok(text);
+        }
+
+        // 上游没按 SSE 回：当成普通 JSON 响应处理。
+        let body = String::from_utf8_lossy(&raw).to_string();
+        if body.trim().is_empty() {
+            return Err(Attempt::transport(
+                Some(status.as_u16()),
+                true,
+                "上游返回了空响应".into(),
+            ));
+        }
+        Ok(body)
+    }
+
     pub async fn send_json(&self, label: &str, make: impl Fn() -> RequestBuilder) -> Result<Value> {
         let body = self.send(label, make).await?;
         serde_json::from_str(&body)
@@ -112,9 +249,12 @@ impl Http {
         &self,
         make: &impl Fn() -> RequestBuilder,
     ) -> std::result::Result<String, Attempt> {
-        let resp = make().send().await.map_err(|e| Attempt {
-            retryable: e.is_timeout() || e.is_connect() || e.is_request(),
-            message: self.redact(&format!("{e}")),
+        let resp = make().send().await.map_err(|e| {
+            Attempt::transport(
+                None,
+                e.is_timeout() || e.is_connect() || e.is_request(),
+                self.redact(&format!("{e}")),
+            )
         })?;
 
         let status = resp.status();
@@ -123,31 +263,56 @@ impl Http {
             return Ok(body);
         }
 
-        Err(Attempt {
-            retryable: is_retryable_status(status),
-            message: format!(
+        Err(Attempt::transport(
+            Some(status.as_u16()),
+            is_retryable_status(status),
+            format!(
                 "HTTP {status}{} — {}",
-                auth_hint(status),
+                status_hint(status),
                 self.redact(&preview(&body))
             ),
-        })
+        ))
     }
 }
 
 struct Attempt {
     retryable: bool,
+    status: Option<u16>,
     message: String,
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+impl Attempt {
+    fn transport(status: Option<u16>, retryable: bool, message: String) -> Self {
+        Self {
+            retryable,
+            status,
+            message,
+        }
+    }
 }
 
-fn auth_hint(status: StatusCode) -> &'static str {
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        // 常规瞬时故障
+        408 | 409 | 425 | 429 | 500 | 502 | 503 | 504
+        // Cloudflare 自定义区间：网关自己超时/连不上源站，重试有意义。
+        // 525/526 是 TLS 配置问题，重试没用。
+        | 520 | 521 | 522 | 523 | 524 | 527
+    )
+}
+
+/// 把常见状态码翻译成「接下来该怎么办」。
+fn status_hint(status: StatusCode) -> &'static str {
     match status.as_u16() {
         401 | 403 => "（密钥无效或无权限）",
         404 => "（端点或模型名不存在）",
         429 => "（触发限流）",
+        413 => "（请求体过大，剧本可能太长）",
+        520 | 521 | 523 => "（Cloudflare 连不上上游服务）",
+        522 => "（Cloudflare 连接上游超时）",
+        524 => "（Cloudflare 网关超时：上游在 100 秒内没返回。多见于代理 + 慢模型 + 长剧本，可换更快的模型、缩短剧本，或改用官方端点）",
+        525 | 526 => "（Cloudflare 与上游的 TLS 握手失败）",
         _ => "",
     }
 }
@@ -212,5 +377,17 @@ mod tests {
         assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
         assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
         assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        // Cloudflare 网关超时属于瞬时故障
+        assert!(is_retryable_status(StatusCode::from_u16(524).unwrap()));
+        assert!(is_retryable_status(StatusCode::from_u16(520).unwrap()));
+        // TLS 配置问题重试无意义
+        assert!(!is_retryable_status(StatusCode::from_u16(525).unwrap()));
+    }
+
+    #[test]
+    fn gateway_timeout_explains_itself() {
+        let hint = status_hint(StatusCode::from_u16(524).unwrap());
+        assert!(hint.contains("Cloudflare"), "{hint}");
+        assert!(hint.contains("100"), "{hint}");
     }
 }

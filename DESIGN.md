@@ -119,7 +119,7 @@ my-drama/
 
 | 阶段 | 关键点 |
 |------|--------|
-| 拆解 | 结构化输出。OpenAI 走 `json_schema`，失败自动降级到 `json_object`；Gemini 的 `responseSchema` 不接受 `additionalProperties` 与联合类型，由 `to_gemini_schema` 翻译 |
+| 拆解 | **流式**请求（避免网关 100 秒超时判 524）。OpenAI 走 `json_schema`，仅在上游明确拒绝请求体或返回非法 JSON 时降级到 `json_object`——超时不降级，否则等于再烧一次钱；Gemini 的 `responseSchema` 不接受 `additionalProperties` 与联合类型，由 `to_gemini_schema` 翻译 |
 | 资产 | 角色三视图（正/侧/全身），同一段身份描述复用；服化道与场景各一张参考图 |
 | 分镜 | **一致性最大的风险点**：把角色定妆照 + 场景图作为参考图输入，同时把外貌描述冗余写进 prompt。图像模型若不支持参考图，会明确告警而不是静默丢失 |
 | 视频 | 提交后先把 operation id 落盘再等待，中断后重跑会**续查**而不是重新付费；超时同样保留 id |
