@@ -270,6 +270,122 @@ pub async fn execute(req: JobRequest, ctx: &JobContext) -> Result<JobOutcome> {
     }
 }
 
+/// 用户自己准备的素材：图片转成 PNG 放到该条目该在的位置，视频原样复制。
+/// 之后这一条会被标记为「手动」，批量重生成不会覆盖它。
+pub fn import_item_file(
+    root: &std::path::Path,
+    stage: Stage,
+    id: &str,
+    source: &std::path::Path,
+) -> Result<PathBuf> {
+    use crate::model::project::write_atomic;
+    use crate::model::{AssetKind, AssetMeta, ItemStatus, StoryboardMeta, VideoMeta, ASSET_KINDS};
+
+    let project = Project::open(root)?;
+    if !source.is_file() {
+        anyhow::bail!("找不到文件：{}", source.display());
+    }
+
+    match stage {
+        Stage::Parse => anyhow::bail!("拆解阶段不支持导入素材"),
+        Stage::Assets => {
+            let kind = ASSET_KINDS
+                .into_iter()
+                .find(|k| project.asset_dir(*k, id).is_dir())
+                .or_else(|| asset_kind_of(&project, id))
+                .with_context(|| format!("找不到资产 {id}"))?;
+            let dir = project.asset_dir(kind, id);
+            std::fs::create_dir_all(&dir)?;
+            // 角色以正面图作为后续分镜的参考，其余用 ref.png。
+            let file = if kind == AssetKind::Character {
+                "front.png"
+            } else {
+                "ref.png"
+            };
+            let target = dir.join(file);
+            save_as_png(source, &target)?;
+
+            let meta_path = dir.join("meta.json");
+            let mut meta: AssetMeta = std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            meta.id = id.to_string();
+            meta.kind = kind.tag().into();
+            if meta.name.is_empty() {
+                meta.name = id.to_string();
+            }
+            if !meta.files.iter().any(|f| f == file) {
+                meta.files.push(file.to_string());
+            }
+            meta.status = ItemStatus::Done;
+            meta.error = None;
+            meta.manual = true;
+            write_atomic(&meta_path, serde_json::to_string_pretty(&meta)?.as_bytes())?;
+            Ok(target)
+        }
+        Stage::Storyboard => {
+            let target = project.storyboard_image(id);
+            save_as_png(source, &target)?;
+
+            let path = project.storyboard_meta(id);
+            let mut meta: StoryboardMeta = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            meta.shot_id = id.to_string();
+            meta.image = Some(format!("{id}.png"));
+            meta.status = ItemStatus::Done;
+            meta.error = None;
+            meta.manual = true;
+            write_atomic(&path, serde_json::to_string_pretty(&meta)?.as_bytes())?;
+            Ok(target)
+        }
+        Stage::Video => {
+            let ext = source
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != "mp4" {
+                anyhow::bail!("视频请提供 .mp4（当前是 .{ext}）：拼接成片按 mp4 直接复制流处理");
+            }
+            let target = project.video_clip(id);
+            std::fs::create_dir_all(project.video_dir())?;
+            std::fs::copy(source, &target)
+                .with_context(|| format!("复制到 {}", target.display()))?;
+
+            let path = project.video_meta(id);
+            let mut meta: VideoMeta = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            meta.shot_id = id.to_string();
+            meta.video = Some(format!("{id}.mp4"));
+            meta.status = ItemStatus::Done;
+            meta.error = None;
+            meta.manual = true;
+            meta.operation_name = None;
+            write_atomic(&path, serde_json::to_string_pretty(&meta)?.as_bytes())?;
+            Ok(target)
+        }
+    }
+}
+
+/// 统一转成 PNG：流水线各处都按 .png 找文件，jpg/webp 直接改名会找不到。
+fn save_as_png(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let bytes = std::fs::read(source)
+        .with_context(|| format!("读取 {}", source.display()))?;
+    let image = image::load_from_memory(&bytes)
+        .with_context(|| format!("无法识别的图片格式：{}", source.display()))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    image
+        .save_with_format(target, image::ImageFormat::Png)
+        .with_context(|| format!("写入 {}", target.display()))
+}
+
 /// Persist a hand-edited prompt for a single item so the next run uses it.
 /// An empty `text` clears the override and restores the composed default.
 pub fn save_prompt(root: &std::path::Path, stage: Stage, id: &str, text: &str) -> Result<()> {

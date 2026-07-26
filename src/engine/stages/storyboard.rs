@@ -32,6 +32,7 @@ struct ShotJob {
     shot: Shot,
     prompt: String,
     references: Vec<std::path::PathBuf>,
+    manual: bool,
 }
 
 pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
@@ -51,6 +52,9 @@ pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
             prompt: stored_prompt(ctx.project, &shot.id, sel.reset_prompts)
                 .unwrap_or_else(|| prompts::storyboard_prompt(style, &bd, shot)),
             references: references_for_shot(ctx.project, &bd, shot),
+            manual: stored_meta(ctx.project, &shot.id)
+                .map(|m| m.manual)
+                .unwrap_or(false),
         })
         .collect();
 
@@ -91,10 +95,14 @@ pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
     let concurrency = ctx.config().generation.image_concurrency;
     let items: Vec<(String, ShotJob)> = jobs.into_iter().map(|j| (j.shot.id.clone(), j)).collect();
 
+    let bulk = sel.shots.is_empty();
     run_items(ctx.events, Stage::Storyboard, concurrency, items, |id, job| {
         let provider = Arc::clone(&provider);
         async move {
             ctx.check_cancel()?;
+            if bulk && job.manual {
+                return Ok(ItemOutcome::Skipped("手动导入，已保留".into()));
+            }
             let out = ctx.project.storyboard_image(&id);
             if out.is_file() && !sel.force {
                 return Ok(ItemOutcome::Skipped("已存在，跳过".into()));
@@ -131,12 +139,16 @@ pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
     .await
 }
 
+fn stored_meta(project: &Project, shot_id: &str) -> Option<StoryboardMeta> {
+    let text = std::fs::read_to_string(project.storyboard_meta(shot_id)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn stored_prompt(project: &Project, shot_id: &str, reset: bool) -> Option<String> {
     if reset {
         return None;
     }
-    let text = std::fs::read_to_string(project.storyboard_meta(shot_id)).ok()?;
-    let meta: StoryboardMeta = serde_json::from_str(&text).ok()?;
+    let meta = stored_meta(project, shot_id)?;
     (!meta.prompt.trim().is_empty()).then_some(meta.prompt)
 }
 
@@ -155,6 +167,7 @@ fn write_meta(project: &Project, job: &ShotJob, status: ItemStatus, error: Optio
             .then(|| image.file_name().unwrap().to_string_lossy().to_string()),
         status,
         error,
+        manual: false,
     };
     if let Ok(text) = serde_json::to_string_pretty(&meta) {
         let _ = crate::model::project::write_atomic(

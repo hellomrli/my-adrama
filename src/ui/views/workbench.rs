@@ -77,23 +77,66 @@ fn toolbar(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
         .filter(|i| i.status == ItemStatus::Failed)
         .map(|i| i.id.clone())
         .collect();
+    let checked = cx.state.checked_ids(stage);
     let has_clips = stage == Stage::Video && counts.ready > 0;
 
     let mut job: Option<Job> = None;
+    let mut clear_checked = false;
     let mut filter = cx.state.item_filter;
     let mut thumb = cx.state.thumb_size;
 
     ui.horizontal_wrapped(|ui| {
-        if widgets::primary_button(ui, "生成缺失", !busy) {
-            job = Some(all_job(stage, false));
+        // 有勾选时，主按钮就是「只生成这些」——批量得自己另外点。
+        if !checked.is_empty() {
+            if widgets::primary_button(ui, &format!("生成所选（{}）", checked.len()), !busy) {
+                job = Some(selection_job(stage, checked.clone()));
+            }
+            if widgets::button(ui, "取消勾选", true) {
+                clear_checked = true;
+            }
+            ui.separator();
         }
-        if widgets::button(ui, "全部重生成", !busy) {
-            job = Some(all_job(stage, true));
-        }
-        if widgets::button(ui, &format!("重试失败（{}）", failed_ids.len()), !busy && !failed_ids.is_empty())
-        {
-            job = Some(selection_job(stage, failed_ids.clone()));
-        }
+
+        // 批量操作收进菜单：默认路径是逐条 / 按组 / 勾选，批量得自己找出来。
+        ui.menu_button("批量…", |ui| {
+            ui.set_min_width(180.0);
+            if ui
+                .add_enabled(
+                    !busy && counts.pending > 0,
+                    egui::Button::new(format!("生成全部缺失（{}）", counts.pending)),
+                )
+                .clicked()
+            {
+                job = Some(all_job(stage, false));
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    !busy && !failed_ids.is_empty(),
+                    egui::Button::new(format!("重试全部失败（{}）", failed_ids.len())),
+                )
+                .clicked()
+            {
+                job = Some(selection_job(stage, failed_ids.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    !busy && counts.total > 0,
+                    egui::Button::new(
+                        RichText::new(format!("全部重生成（{}）", counts.total))
+                            .color(theme::DANGER),
+                    ),
+                )
+                .on_hover_text("会重跑每一条并覆盖已有结果（你自己上传的素材不会被动）")
+                .clicked()
+            {
+                job = Some(all_job(stage, true));
+                ui.close_menu();
+            }
+        });
+
         if has_clips && widgets::button(ui, "拼接成片", !busy) {
             job = Some(Job::Export);
         }
@@ -107,7 +150,6 @@ fn toolbar(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
             job = Some(Job::Approve(stage));
         }
         widgets::pill(ui, status.label(), theme::stage_status_color(status));
-        widgets::hint(ui, &counts.summary());
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
@@ -128,11 +170,31 @@ fn toolbar(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
         });
     });
 
+    // 进度与提示单独一行，工具栏本身保持干净
+    ui.horizontal(|ui| {
+        widgets::meter(
+            ui,
+            counts.ratio(),
+            theme::stage_color(stage),
+            140.0,
+        );
+        widgets::hint(ui, &counts.summary());
+        ui.separator();
+        widgets::hint(
+            ui,
+            "勾选卡片可只生成选中项；每组标题右侧可生成该组；右侧可逐条生成或上传自己的素材",
+        );
+    });
+
     cx.state.item_filter = filter;
     if (thumb - cx.state.thumb_size).abs() > 0.5 {
         cx.state.thumb_size = thumb;
     }
+    if clear_checked {
+        cx.state.clear_checked(stage);
+    }
     if let Some(job) = job {
+        cx.state.clear_checked(stage);
         cx.state.submit(cx.runtime, job);
     }
 }
@@ -170,18 +232,20 @@ fn grid(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage, items: &[ItemView]) {
     let selected = cx.state.selected_id(stage).map(str::to_string);
     let mut clicked: Option<ItemView> = None;
     let mut preview: Option<std::path::PathBuf> = None;
+    let mut toggle: Option<String> = None;
+    let mut group_job: Option<Vec<String>> = None;
 
     let visible: Vec<&ItemView> = items
         .iter()
         .filter(|item| filter.accepts(cx.state.item_status(stage, item).0))
         .collect();
 
-    // Columns are computed rather than left to `horizontal_wrapped`, which
-    // decides after an item has already overflowed the row.
+    // 列数自己算：horizontal_wrapped 是在超出之后才换行，会把最后一张切掉。
     let card_width = thumb + CARD_CHROME;
     let spacing = ui.spacing().item_spacing.x;
     let columns = (((ui.available_width() + spacing) / (card_width + spacing)).floor() as usize)
         .max(1);
+    let busy = cx.state.is_busy();
 
     egui::ScrollArea::vertical()
         .id_salt(("grid", stage))
@@ -191,34 +255,122 @@ fn grid(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage, items: &[ItemView]) {
                 widgets::hint(ui, "当前筛选下没有条目。");
                 return;
             }
-            for row in visible.chunks(columns) {
-                ui.horizontal_top(|ui| {
-                    for item in row {
-                        let (status, detail) = cx.state.item_status(stage, item);
-                        let is_selected = selected.as_deref() == Some(item.id.as_str());
-                        let response =
-                            card(ui, cx, item, status, detail.as_deref(), thumb, is_selected);
-                        if response.clicked() {
-                            clicked = Some((*item).clone());
-                        }
-                        if response.double_clicked() {
-                            if let Some(path) = item.thumbnail() {
-                                preview = Some(path.to_path_buf());
-                            }
-                        }
+
+            for group in group_items(stage, &visible) {
+                ui.add_space(theme::SPACE_MD);
+                ui.horizontal(|ui| {
+                    widgets::group_title(ui, &group.title, theme::stage_color(stage));
+                    let pending = group
+                        .items
+                        .iter()
+                        .filter(|i| !matches!(i.status, ItemStatus::Done | ItemStatus::Approved))
+                        .count();
+                    widgets::hint(
+                        ui,
+                        &format!("{} 项 · {} 待生成", group.items.len(), pending),
+                    );
+                    if pending > 0 && widgets::button(ui, "生成本组缺失", !busy) {
+                        group_job = Some(
+                            group
+                                .items
+                                .iter()
+                                .filter(|i| {
+                                    !matches!(i.status, ItemStatus::Done | ItemStatus::Approved)
+                                })
+                                .map(|i| i.id.clone())
+                                .collect(),
+                        );
                     }
                 });
+                ui.add_space(theme::SPACE_XS);
+
+                for row in group.items.chunks(columns) {
+                    ui.horizontal_top(|ui| {
+                        for item in row {
+                            let (status, detail) = cx.state.item_status(stage, item);
+                            let is_selected = selected.as_deref() == Some(item.id.as_str());
+                            let is_checked = cx.state.is_checked(stage, &item.id);
+                            let response = card(
+                                ui,
+                                cx,
+                                item,
+                                status,
+                                detail.as_deref(),
+                                thumb,
+                                is_selected,
+                                is_checked,
+                                &mut toggle,
+                            );
+                            if response.clicked() {
+                                clicked = Some((*item).clone());
+                            }
+                            if response.double_clicked() {
+                                if let Some(path) = item.thumbnail() {
+                                    preview = Some(path.to_path_buf());
+                                }
+                            }
+                        }
+                    });
+                }
             }
         });
 
+    if let Some(id) = toggle {
+        cx.state.toggle_checked(stage, &id);
+    }
     if let Some(item) = clicked {
         cx.state.select(stage, &item);
     }
     if let Some(path) = preview {
         cx.state.preview = Some(path);
     }
+    if let Some(ids) = group_job {
+        if !ids.is_empty() {
+            cx.state.submit(cx.runtime, selection_job(stage, ids));
+        }
+    }
 }
 
+struct Group<'a> {
+    title: String,
+    items: Vec<&'a ItemView>,
+}
+
+/// 资产按角色/服装/道具/场景分组，分镜与视频按场次分组——不要堆成一片。
+fn group_items<'a>(stage: Stage, items: &[&'a ItemView]) -> Vec<Group<'a>> {
+    let mut groups: Vec<Group<'a>> = Vec::new();
+    let mut push = |title: String, item: &'a ItemView| match groups.iter_mut().find(|g| g.title == title) {
+        Some(group) => group.items.push(item),
+        None => groups.push(Group {
+            title,
+            items: vec![item],
+        }),
+    };
+
+    match stage {
+        Stage::Assets => {
+            for kind in crate::model::ASSET_KINDS {
+                for item in items {
+                    if item.kind == crate::model::index::ItemKind::Asset(kind) {
+                        push(kind.label().to_string(), item);
+                    }
+                }
+            }
+        }
+        _ => {
+            for item in items {
+                let title = match item.scene {
+                    Some(n) => format!("第 {n} 场"),
+                    None => "未归入场次".to_string(),
+                };
+                push(title, item);
+            }
+        }
+    }
+    groups
+}
+
+#[allow(clippy::too_many_arguments)]
 fn card(
     ui: &mut Ui,
     cx: &mut ViewCtx<'_>,
@@ -227,10 +379,14 @@ fn card(
     detail: Option<&str>,
     thumb: f32,
     selected: bool,
+    checked: bool,
+    toggle: &mut Option<String>,
 ) -> egui::Response {
     let color = theme::item_status_color(status);
     let stroke = if selected {
         egui::Stroke::new(1.6_f32, theme::ACCENT)
+    } else if checked {
+        egui::Stroke::new(1.4_f32, theme::INFO)
     } else {
         egui::Stroke::new(1.0_f32, theme::BORDER)
     };
@@ -238,6 +394,8 @@ fn card(
     let response = egui::Frame::new()
         .fill(if selected {
             theme::tint(theme::ACCENT, 22)
+        } else if checked {
+            theme::tint(theme::INFO, 18)
         } else {
             theme::SURFACE
         })
@@ -247,47 +405,43 @@ fn card(
         .show(ui, |ui| {
             ui.set_width(thumb);
             ui.vertical(|ui| {
-            // Fixed-size image box keeps every card the same height whatever
-            // the frame aspect ratio is.
-            let texture = item
-                .thumbnail()
-                .and_then(|path| cx.thumbs.get(ui.ctx(), path, (thumb * 2.0) as u32));
-            let placeholder = if item.thumbnail().is_some() {
-                "加载中…"
-            } else {
-                "未生成"
-            };
-            image_box(ui, thumb, thumb * IMAGE_RATIO, texture, placeholder);
+                // 勾选框：只生成挑中的几条
+                ui.horizontal(|ui| {
+                    let mut is_checked = checked;
+                    if ui
+                        .checkbox(&mut is_checked, "")
+                        .on_hover_text("勾选后可在上方「生成所选」中一起生成")
+                        .changed()
+                    {
+                        *toggle = Some(item.id.clone());
+                    }
+                    if item.manual {
+                        widgets::pill(ui, "自备", theme::INFO);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        widgets::dot(ui, color, 8.0);
+                    });
+                });
 
-            ui.add_space(theme::SPACE_XS);
-            ui.horizontal(|ui| {
+                // 固定大小的图框，保证同一行卡片等高
+                let texture = item
+                    .thumbnail()
+                    .and_then(|path| cx.thumbs.get(ui.ctx(), path, (thumb * 2.0) as u32));
+                let placeholder = if item.thumbnail().is_some() {
+                    "加载中…"
+                } else {
+                    "未生成"
+                };
+                image_box(ui, thumb, thumb * IMAGE_RATIO, texture, placeholder);
+
+                ui.add_space(theme::SPACE_XS);
                 ui.add(
                     egui::Label::new(RichText::new(&item.title).strong().size(12.5)).truncate(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::dot(ui, color, 8.0);
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(item.kind.label())
-                        .small()
-                        .color(theme::TEXT_DIM),
+                let sub = detail.unwrap_or(&item.subtitle);
+                ui.add(
+                    egui::Label::new(RichText::new(sub).small().color(theme::TEXT_DIM)).truncate(),
                 );
-                if let Some(scene) = item.scene {
-                    ui.label(
-                        RichText::new(format!("第 {scene} 场"))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-            });
-            let sub = detail.unwrap_or(&item.subtitle);
-            // Truncate rather than wrap so every card in a row is the same height.
-            ui.add(
-                egui::Label::new(RichText::new(sub).small().color(theme::TEXT_DIM))
-                    .truncate(),
-            );
             });
         })
         .response
@@ -348,6 +502,7 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
     let mut regenerate = false;
     let mut save_prompt = false;
     let mut reset_prompt = false;
+    let mut upload = false;
     let mut preview: Option<std::path::PathBuf> = None;
 
     theme::card().show(ui, |ui| {
@@ -406,8 +561,19 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
 
                 ui.add_space(theme::SPACE_MD);
                 ui.horizontal_wrapped(|ui| {
-                    if widgets::primary_button(ui, "重新生成此条", !busy) {
+                    if widgets::primary_button(ui, "生成这一条", !busy) {
                         regenerate = true;
+                    }
+                    if widgets::button(
+                        ui,
+                        if stage == Stage::Video {
+                            "上传片段…"
+                        } else {
+                            "上传图片…"
+                        },
+                        !busy,
+                    ) {
+                        upload = true;
                     }
                     if let Some(media) = &item.media {
                         if widgets::button(ui, "播放片段", true) {
@@ -444,6 +610,13 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
                     }
                 }
 
+                if item.manual {
+                    ui.add_space(theme::SPACE_SM);
+                    widgets::hint(
+                        ui,
+                        "这一条是你自己上传的：批量生成不会覆盖它，只有单独点「生成这一条」才会。",
+                    );
+                }
                 if let Some(seconds) = item.duration_secs {
                     ui.add_space(theme::SPACE_SM);
                     widgets::hint(ui, &format!("时长 {seconds} 秒"));
@@ -456,6 +629,9 @@ fn inspector(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
     }
     if save_prompt || reset_prompt {
         persist_prompt(cx, stage, &item.id, reset_prompt);
+    }
+    if upload {
+        import_file(cx, stage, &item.id);
     }
     if regenerate {
         cx.state
@@ -518,6 +694,30 @@ fn prompt_editor(
             *reset = true;
         }
     });
+}
+
+/// 让用户把自己的素材放进这一条：图片统一转成 PNG，视频按 mp4 复制。
+fn import_file(cx: &mut ViewCtx<'_>, stage: Stage, id: &str) {
+    let Some(root) = cx.state.root() else {
+        return;
+    };
+    let dialog = if stage == Stage::Video {
+        rfd::FileDialog::new().add_filter("视频", &["mp4"])
+    } else {
+        rfd::FileDialog::new().add_filter("图片", &["png", "jpg", "jpeg", "webp", "bmp"])
+    };
+    let Some(source) = dialog.pick_file() else {
+        return;
+    };
+
+    match crate::engine::import_item_file(&root, stage, id, &source) {
+        Ok(target) => {
+            cx.thumbs.invalidate(&target);
+            cx.state.note(format!("已导入 → {}", target.display()));
+            cx.state.refresh(cx.runtime);
+        }
+        Err(err) => cx.state.fail(format!("导入失败：{err:#}")),
+    }
 }
 
 /// Write the edited prompt back to the sidecar (or clear it, restoring the

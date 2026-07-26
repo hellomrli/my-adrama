@@ -344,15 +344,18 @@ impl AdramaApp {
 
         let response = widgets::selectable_row(ui, selected, |ui| {
             ui.horizontal(|ui| {
-                match stage {
-                    Some(stage) => widgets::dot(ui, theme::stage_color(stage), 8.0),
-                    None => widgets::dot(ui, theme::TEXT_DIM, 8.0),
-                }
-                ui.label(RichText::new(label).color(if selected {
-                    theme::TEXT
+                let accent = stage.map(theme::stage_color).unwrap_or(theme::TEXT_DIM);
+                if selected {
+                    theme::accent_bar(ui, accent, 16.0);
+                    ui.add_space(2.0);
                 } else {
-                    theme::TEXT_MUTED
-                }));
+                    widgets::dot(ui, accent, 7.0);
+                }
+                ui.label(
+                    RichText::new(label)
+                        .strong()
+                        .color(if selected { theme::TEXT } else { theme::TEXT_MUTED }),
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(status) = status {

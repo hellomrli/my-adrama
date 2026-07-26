@@ -37,6 +37,8 @@ pub const SPACE_SM: f32 = 8.0;
 pub const SPACE_MD: f32 = 12.0;
 pub const SPACE_LG: f32 = 18.0;
 
+pub const SPACE_XL: f32 = 26.0;
+
 pub const RADIUS_SM: f32 = 6.0;
 pub const RADIUS_MD: f32 = 10.0;
 pub const RADIUS_LG: f32 = 14.0;
@@ -155,6 +157,15 @@ fn visuals() -> Visuals {
 }
 
 // --- frames -----------------------------------------------------------------
+
+/// 分区标题左侧的强调条，比纯加粗更容易扫读。
+pub fn accent_bar(ui: &mut egui::Ui, color: Color32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(3.0, height),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 1.5, color);
+}
 
 pub fn card() -> egui::Frame {
     egui::Frame::new()

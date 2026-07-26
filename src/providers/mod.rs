@@ -252,10 +252,11 @@ impl<'a> ProviderFactory<'a> {
     pub fn video(&self) -> Result<Arc<dyn VideoProvider>> {
         let (endpoint, key) = self.resolve(Capability::Video)?;
         let http = self.http(&key, Duration::from_secs(180))?;
-        match endpoint.provider {
-            ProviderId::Google => Ok(Arc::new(google::GoogleClient::new(http, key, endpoint))),
-            other => bail!("{} 暂不支持视频生成", other.label()),
-        }
+        Ok(match endpoint.provider {
+            ProviderId::Google => Arc::new(google::GoogleClient::new(http, key, endpoint)),
+            // xAI 及 OpenAI 兼容的中转：按「提交任务 → 轮询 → 取回」的通用形态调用。
+            _ => Arc::new(openai::OpenAiCompatible::new(http, key, endpoint)),
+        })
     }
 }
 
@@ -365,14 +366,31 @@ mod tests {
 
     #[test]
     fn unsupported_capability_is_rejected_before_any_request() {
+        // OpenAI 这边没有视频能力：选中它应当在开跑前就被拒绝，
+        // 而不是发出一个形状错误的请求。
         let mut config = ProjectConfig::default();
-        config.slot_mut(Capability::Video).provider = ProviderId::Xai;
+        config.slot_mut(Capability::Video).provider = ProviderId::OpenAi;
         let creds = creds_with_all();
         let err = ProviderFactory::new(&config, &creds)
             .video()
             .err()
-            .expect("xAI has no video capability");
-        assert!(err.to_string().contains("视频"), "{err}");
+            .expect("OpenAI 没有视频能力");
+        let msg = err.to_string();
+        assert!(msg.contains("视频"), "{msg}");
+        // 报错要顺带告诉用户可以选谁
+        assert!(msg.contains("Google") || msg.contains("xAI"), "{msg}");
+    }
+
+    #[test]
+    fn xai_can_serve_video() {
+        let mut config = ProjectConfig::default();
+        config.slot_mut(Capability::Video).provider = ProviderId::Xai;
+        let creds = creds_with_all();
+        let video = ProviderFactory::new(&config, &creds)
+            .video()
+            .expect("xAI 提供视频能力");
+        assert_eq!(video.endpoint().provider, ProviderId::Xai);
+        assert_eq!(video.endpoint().base_url, "https://api.x.ai/v1");
     }
 
     #[test]

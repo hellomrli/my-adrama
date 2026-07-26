@@ -1,6 +1,6 @@
 [package]
 name = "adrama"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 description = "AI short-drama production workflow (GUI + CLI)"
 license = "MIT"

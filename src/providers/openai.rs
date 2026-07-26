@@ -9,7 +9,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::http::{Http, HttpError};
-use super::{ChatJsonRequest, ChatProvider, ImageProvider, ImageRequest};
+use super::{
+    ChatJsonRequest, ChatProvider, ImageProvider, ImageRequest, VideoPoll, VideoProvider,
+    VideoRequest,
+};
 use crate::model::Endpoint;
 
 pub struct OpenAiCompatible {
@@ -248,6 +251,164 @@ impl ImageProvider for OpenAiCompatible {
     }
 }
 
+impl VideoProvider for OpenAiCompatible {
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// 提交一个视频任务，返回任务 id。
+    ///
+    /// OpenAI 兼容阵营（xAI、各类中转）大多是「POST 建任务 → 轮询 → 取回」这一套，
+    /// 但路径与字段名并不统一。这里按最常见的形态提交，并把上游原样的响应放进
+    /// 错误信息里——一旦对不上，看一眼就知道该怎么改。
+    fn submit<'a>(&'a self, req: VideoRequest<'a>) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let frame = tokio::fs::read(req.image)
+                .await
+                .with_context(|| format!("读取首帧 {}", req.image.display()))?;
+            let data_url = format!(
+                "data:{};base64,{}",
+                mime_for(req.image),
+                base64::engine::general_purpose::STANDARD.encode(&frame)
+            );
+
+            let body = json!({
+                "model": self.endpoint.model,
+                "prompt": req.prompt,
+                "seconds": req.duration_secs,
+                "duration": req.duration_secs,
+                "aspect_ratio": req.aspect.as_str(),
+                "image": data_url,
+            });
+
+            // 先试 /videos，不认再试 /videos/generations。
+            let mut last_err = None;
+            for path in ["videos", "videos/generations"] {
+                let url = self.url(path);
+                match self
+                    .http
+                    .send_json("提交视频任务", || {
+                        self.http
+                            .client()
+                            .post(&url)
+                            .bearer_auth(&self.api_key)
+                            .json(&body)
+                    })
+                    .await
+                {
+                    Ok(value) => {
+                        return extract_job_id(&value).ok_or_else(|| {
+                            anyhow!(
+                                "提交成功但没找到任务 id：{}",
+                                super::http::preview(&value.to_string())
+                            )
+                        })
+                    }
+                    Err(err) => {
+                        let unsupported = err
+                            .downcast_ref::<HttpError>()
+                            .map(|e| matches!(e.status, Some(404 | 405)))
+                            .unwrap_or(false);
+                        last_err = Some(err);
+                        if !unsupported {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow!("提交视频任务失败")))
+        })
+    }
+
+    fn poll<'a>(&'a self, operation: &'a str) -> BoxFuture<'a, Result<VideoPoll>> {
+        Box::pin(async move {
+            let url = self.url(&format!("videos/{operation}"));
+            let value = self
+                .http
+                .send_json("查询视频任务", || {
+                    self.http.client().get(&url).bearer_auth(&self.api_key)
+                })
+                .await?;
+
+            let status = ["/status", "/state", "/data/status"]
+                .iter()
+                .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            if ["failed", "error", "cancelled", "canceled"].contains(&status.as_str()) {
+                bail!(
+                    "视频任务失败：{}",
+                    super::http::preview(&value.to_string())
+                );
+            }
+
+            if let Some(url) = find_video_url(&value) {
+                let url = url.to_string();
+                let bytes = self
+                    .http
+                    .send_bytes("下载视频", || self.http.client().get(&url).bearer_auth(&self.api_key))
+                    .await?;
+                return Ok(VideoPoll::Ready(bytes));
+            }
+            if let Some(b64) = find_video_base64(&value) {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .context("解码视频数据")?;
+                return Ok(VideoPoll::Ready(bytes));
+            }
+
+            // 完成了却没给地址：有些实现要单独取内容。
+            if ["completed", "succeeded", "success", "done", "ready"].contains(&status.as_str()) {
+                let content = self.url(&format!("videos/{operation}/content"));
+                return self
+                    .http
+                    .send_bytes("下载视频", || {
+                        self.http.client().get(&content).bearer_auth(&self.api_key)
+                    })
+                    .await
+                    .map(VideoPoll::Ready);
+            }
+
+            Ok(VideoPoll::Pending)
+        })
+    }
+}
+
+/// 任务 id 在不同实现里叫法不一。
+fn extract_job_id(value: &Value) -> Option<String> {
+    ["/id", "/data/id", "/task_id", "/request_id", "/job_id"]
+        .iter()
+        .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+fn find_video_url(value: &Value) -> Option<&str> {
+    [
+        "/url",
+        "/video_url",
+        "/data/0/url",
+        "/data/url",
+        "/output/0/url",
+        "/result/url",
+        "/video/url",
+    ]
+    .iter()
+    .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+    .filter(|url| url.starts_with("http"))
+}
+
+fn find_video_base64(value: &Value) -> Option<&str> {
+    [
+        "/b64_json",
+        "/data/0/b64_json",
+        "/video/bytesBase64Encoded",
+        "/output/0/b64_json",
+    ]
+    .iter()
+    .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+}
+
 /// `GET /models` — used by the settings connectivity test.
 pub async fn list_models(http: &Http, base: &str, key: &str) -> Result<Vec<String>> {
     let url = format!("{base}/models");
@@ -357,6 +518,22 @@ mod tests {
         assert!(extract_delta(&json!({"choices":[{"delta":{"reasoning_content":"想想"}}]})).is_none());
         // 空分片（心跳）
         assert!(extract_delta(&json!({"choices":[{"delta":{}}]})).is_none());
+    }
+
+    #[test]
+    fn video_job_fields_are_tolerated() {
+        assert_eq!(extract_job_id(&json!({"id":"vid_1"})).as_deref(), Some("vid_1"));
+        assert_eq!(extract_job_id(&json!({"data":{"id":"vid_2"}})).as_deref(), Some("vid_2"));
+        assert_eq!(extract_job_id(&json!({"task_id":"vid_3"})).as_deref(), Some("vid_3"));
+        assert!(extract_job_id(&json!({"error":"nope"})).is_none());
+
+        assert_eq!(
+            find_video_url(&json!({"data":[{"url":"https://x/v.mp4"}]})),
+            Some("https://x/v.mp4")
+        );
+        // 相对路径不算可下载地址
+        assert!(find_video_url(&json!({"url":"/tmp/v.mp4"})).is_none());
+        assert_eq!(find_video_base64(&json!({"b64_json":"AAAA"})), Some("AAAA"));
     }
 
     #[test]

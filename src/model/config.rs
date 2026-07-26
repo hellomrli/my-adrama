@@ -48,7 +48,7 @@ impl ProviderId {
         match self {
             ProviderId::OpenAi => "GPT 对话 · gpt-image 图像",
             ProviderId::Google => "Gemini 对话 · Imagen 图像 · Veo 视频",
-            ProviderId::Xai => "Grok 对话 · Grok 图像",
+            ProviderId::Xai => "Grok 对话 · 图像 · 视频",
         }
     }
 
@@ -60,7 +60,7 @@ impl ProviderId {
             (self, cap),
             (ProviderId::OpenAi, Capability::Chat | Capability::Image)
                 | (ProviderId::Google, _)
-                | (ProviderId::Xai, Capability::Chat | Capability::Image)
+                | (ProviderId::Xai, _)
         )
     }
 
@@ -309,6 +309,7 @@ impl EndpointConfig {
             (ProviderId::Google, Capability::Video) => "veo-3.1-generate-preview",
             (ProviderId::Xai, Capability::Chat) => "grok-2-latest",
             (ProviderId::Xai, Capability::Image) => "grok-2-image",
+            (ProviderId::Xai, Capability::Video) => "grok-video",
             _ => "",
         }
     }

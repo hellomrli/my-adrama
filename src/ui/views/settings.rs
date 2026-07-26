@@ -15,7 +15,7 @@ use crate::ui::state::{SettingsTab, View};
 use crate::ui::{theme, widgets};
 use crate::update::{self, UpdateStatus};
 
-const LABEL_W: f32 = 72.0;
+const LABEL_W: f32 = 88.0;
 
 pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     widgets::page_header(ui, View::Settings.title(), View::Settings.subtitle());

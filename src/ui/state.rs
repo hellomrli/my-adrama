@@ -192,6 +192,8 @@ pub struct AppState {
     /// Per-item status published by a running job, before the disk rescan.
     pub live_status: HashMap<(Stage, String), (ItemStatus, String)>,
     pub selection: HashMap<Stage, String>,
+    /// 勾选待生成的条目（每个阶段一份）。
+    pub checked: HashMap<Stage, std::collections::BTreeSet<String>>,
     pub item_filter: ItemFilter,
     pub prompt_edit: Option<PromptEdit>,
     pub thumb_size: f32,
@@ -246,6 +248,7 @@ impl AppState {
             banner: None,
             live_status: HashMap::new(),
             selection: HashMap::new(),
+            checked: HashMap::new(),
             item_filter: ItemFilter::All,
             prompt_edit: None,
             thumb_size,
@@ -507,6 +510,29 @@ impl AppState {
             Some((status, detail)) => (*status, Some(detail.clone())),
             None => (item.status, None),
         }
+    }
+
+    /// 该阶段被勾选的条目。
+    pub fn checked_ids(&self, stage: Stage) -> Vec<String> {
+        self.checked
+            .get(&stage)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn is_checked(&self, stage: Stage, id: &str) -> bool {
+        self.checked.get(&stage).is_some_and(|set| set.contains(id))
+    }
+
+    pub fn toggle_checked(&mut self, stage: Stage, id: &str) {
+        let set = self.checked.entry(stage).or_default();
+        if !set.remove(id) {
+            set.insert(id.to_string());
+        }
+    }
+
+    pub fn clear_checked(&mut self, stage: Stage) {
+        self.checked.remove(&stage);
     }
 
     pub fn selected_id(&self, stage: Stage) -> Option<&str> {

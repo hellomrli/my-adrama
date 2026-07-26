@@ -41,6 +41,8 @@ struct AssetJob {
     prompt: String,
     /// Output file names; characters get several views.
     views: Vec<(String, String)>,
+    /// 用户自己上传的素材：批量跑时不动它。
+    manual: bool,
 }
 
 pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
@@ -82,10 +84,14 @@ pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
     let concurrency = ctx.config().generation.image_concurrency;
     let items: Vec<(String, AssetJob)> = jobs.into_iter().map(|j| (j.id.clone(), j)).collect();
 
+    let bulk = sel.ids.is_empty();
     run_items(ctx.events, Stage::Assets, concurrency, items, |id, job| {
         let provider = Arc::clone(&provider);
         async move {
             ctx.check_cancel()?;
+            if bulk && job.manual {
+                return Ok(ItemOutcome::Skipped("手动导入，已保留".into()));
+            }
             ctx.events
                 .item(Stage::Assets, &id, ItemStatus::Generating, "生成中");
             match generate_asset(ctx, provider.as_ref(), &job, aspect, sel.force).await {
@@ -124,6 +130,7 @@ fn build_jobs(project: &Project, bd: &Breakdown, sel: &Selection) -> Vec<AssetJo
                 .iter()
                 .map(|(file, desc)| (format!("{file}.png"), desc.to_string()))
                 .collect(),
+            manual: is_manual(project, AssetKind::Character, &ch.id),
         });
     }
 
@@ -139,6 +146,7 @@ fn build_jobs(project: &Project, bd: &Breakdown, sel: &Selection) -> Vec<AssetJo
                 prompts::costume_prompt(style, c)
             }),
             views: vec![("ref.png".into(), String::new())],
+            manual: is_manual(project, AssetKind::Costume, &c.id),
         });
     }
 
@@ -154,6 +162,7 @@ fn build_jobs(project: &Project, bd: &Breakdown, sel: &Selection) -> Vec<AssetJo
                 prompts::prop_prompt(style, p)
             }),
             views: vec![("ref.png".into(), String::new())],
+            manual: is_manual(project, AssetKind::Prop, &p.id),
         });
     }
 
@@ -169,10 +178,20 @@ fn build_jobs(project: &Project, bd: &Breakdown, sel: &Selection) -> Vec<AssetJo
                 prompts::location_prompt(style, l)
             }),
             views: vec![("ref.png".into(), String::new())],
+            manual: is_manual(project, AssetKind::Location, &l.id),
         });
     }
 
     jobs
+}
+
+/// 这一条是不是用户自己放进来的。
+fn is_manual(project: &Project, kind: AssetKind, id: &str) -> bool {
+    std::fs::read_to_string(project.asset_dir(kind, id).join("meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AssetMeta>(&raw).ok())
+        .map(|meta| meta.manual)
+        .unwrap_or(false)
 }
 
 /// A hand-edited `prompt.txt` wins over the composed prompt — that is the whole
@@ -266,6 +285,7 @@ fn write_meta(
         files: files.to_vec(),
         status,
         error,
+        manual: false,
     };
     let path = project.asset_dir(job.kind, &job.id).join("meta.json");
     if let Ok(text) = serde_json::to_string_pretty(&meta) {

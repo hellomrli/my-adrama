@@ -36,7 +36,20 @@ pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
 
 /// Heading inside a card.
 pub fn section_title(ui: &mut Ui, title: &str) {
-    ui.label(RichText::new(title).size(15.0).strong().color(theme::TEXT));
+    ui.horizontal(|ui| {
+        theme::accent_bar(ui, theme::tint(theme::ACCENT, 160), 15.0);
+        ui.add_space(2.0);
+        ui.label(RichText::new(title).size(14.5).strong().color(theme::TEXT));
+    });
+}
+
+/// 带颜色的分组标题（资产类别、场次）。
+pub fn group_title(ui: &mut Ui, title: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        theme::accent_bar(ui, color, 16.0);
+        ui.add_space(2.0);
+        ui.label(RichText::new(title).size(14.0).strong().color(theme::TEXT));
+    });
 }
 
 pub fn hint(ui: &mut Ui, text: &str) {
@@ -89,13 +102,14 @@ pub fn empty_state(ui: &mut Ui, title: &str, hint_text: &str) {
     });
 }
 
-/// Label + widget on one row with a fixed label column.
+/// Label + widget on one row with a fixed, right-aligned label column.
+/// 右对齐让不同长度的标签与控件之间保持同一条竖线，比左对齐整齐得多。
 pub fn field_row(ui: &mut Ui, label: &str, label_width: f32, add: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(label_width, 20.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(label_width, 22.0), Sense::hover());
         ui.painter().text(
-            rect.left_center(),
-            egui::Align2::LEFT_CENTER,
+            rect.right_center() - Vec2::new(10.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
             label,
             egui::TextStyle::Body.resolve(ui.style()),
             theme::TEXT_MUTED,
@@ -206,14 +220,14 @@ pub fn meter(ui: &mut Ui, ratio: f32, color: Color32, width: f32) {
 /// A clickable row that looks like a list item.
 pub fn selectable_row(ui: &mut Ui, selected: bool, add: impl FnOnce(&mut Ui)) -> Response {
     let fill = if selected {
-        theme::tint(theme::ACCENT, 34)
+        theme::tint(theme::ACCENT, 22)
     } else {
         Color32::TRANSPARENT
     };
     let stroke = if selected {
-        Stroke::new(1.0_f32, theme::ACCENT)
+        Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 140))
     } else {
-        Stroke::new(1.0_f32, theme::BORDER)
+        Stroke::new(1.0_f32, theme::tint(theme::BORDER, 140))
     };
     let response = egui::Frame::new()
         .fill(fill)

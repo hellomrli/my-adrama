@@ -74,6 +74,13 @@ pub async fn run(ctx: &StageCtx<'_>, sel: &Selection) -> Result<StageReport> {
             let gen = gen.clone();
             async move {
                 ctx.check_cancel()?;
+                if sel.shots.is_empty()
+                    && read_meta(ctx.project, &shot.id)
+                        .map(|m| m.manual)
+                        .unwrap_or(false)
+                {
+                    return Ok(ItemOutcome::Skipped("手动导入，已保留".into()));
+                }
                 match generate_clip(ctx, provider.as_ref(), &shot, aspect, &gen, sel.force).await {
                     Ok(outcome) => Ok(outcome),
                     Err(err) => {
@@ -154,6 +161,7 @@ async fn generate_clip(
                     video: None,
                     status: ItemStatus::Generating,
                     error: None,
+                    manual: false,
                 },
             );
             op
@@ -176,6 +184,7 @@ async fn generate_clip(
             video: Some(format!("{}.mp4", shot.id)),
             status: ItemStatus::Done,
             error: None,
+            manual: false,
         },
     );
     Ok(ItemOutcome::Generated)

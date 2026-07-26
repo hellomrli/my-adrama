@@ -175,6 +175,9 @@ pub struct AssetMeta {
     pub status: ItemStatus,
     #[serde(default)]
     pub error: Option<String>,
+    /// 用户自己放进来的素材：批量重生成时不会被覆盖。
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// Sidecar written next to every storyboard frame (`<shot>.json`).
@@ -190,6 +193,9 @@ pub struct StoryboardMeta {
     pub status: ItemStatus,
     #[serde(default)]
     pub error: Option<String>,
+    /// 用户自己放进来的画面：批量重生成时不会被覆盖。
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// Sidecar written next to every clip (`<shot>.json`), including the
@@ -208,6 +214,9 @@ pub struct VideoMeta {
     pub status: ItemStatus,
     #[serde(default)]
     pub error: Option<String>,
+    /// 用户自己放进来的片段：批量重生成时不会被覆盖。
+    #[serde(default)]
+    pub manual: bool,
 }
 
 #[cfg(test)]

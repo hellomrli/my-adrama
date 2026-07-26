@@ -50,6 +50,8 @@ pub struct ItemView {
     pub duration_secs: Option<u32>,
     /// Scene number, for grouping shots.
     pub scene: Option<u32>,
+    /// 用户自己上传的素材。
+    pub manual: bool,
 }
 
 impl ItemView {
@@ -219,6 +221,7 @@ fn asset_item(
         media: None,
         prompt,
         references: Vec::new(),
+        manual: meta.as_ref().map(|m| m.manual).unwrap_or(false),
         error: meta.and_then(|m| m.error),
         duration_secs: None,
         scene: None,
@@ -247,6 +250,7 @@ fn storyboard_items(project: &Project, bd: &Breakdown) -> Vec<ItemView> {
                     .as_ref()
                     .map(|m| m.reference_assets.clone())
                     .unwrap_or_default(),
+                manual: meta.as_ref().map(|m| m.manual).unwrap_or(false),
                 error: meta.and_then(|m| m.error),
                 duration_secs: Some(shot.duration_secs),
                 scene,
@@ -286,6 +290,7 @@ fn video_items(project: &Project, bd: &Breakdown) -> Vec<ItemView> {
                     .and_then(|m| m.operation_name.clone())
                     .map(|op| vec![op])
                     .unwrap_or_default(),
+                manual: meta.as_ref().map(|m| m.manual).unwrap_or(false),
                 error: meta.and_then(|m| m.error),
                 duration_secs: Some(shot.duration_secs),
                 scene,
