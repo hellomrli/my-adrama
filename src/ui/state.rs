@@ -538,13 +538,71 @@ impl AppState {
             self.fail("已有任务在运行，请先等待或取消");
             return;
         }
-        runtime.submit(root, job, self.dry_run, self.credentials());
+        // 任务从磁盘读 project.toml。界面里刚改的服务商/模型如果还没保存，
+        // 跑起来用的就会是旧配置——所以先落盘，别让人对着改好的界面纳闷。
+        if !self.flush_pending_edits() {
+            return;
+        }
+
+        // 先在控制台留一行：即使后台线程忙着，用户也知道自己点到了。
+        let label = crate::engine::job_label(&job, self.dry_run);
+        self.push_console(Level::Info, format!("· 已提交：{label}"));
+        if self.dry_run && job.touches_api() {
+            self.push_console(
+                Level::Warn,
+                "演练模式开着：只会展示 prompt，不会真的调用模型（顶栏可取消勾选）",
+            );
+        }
+
+        if !runtime.submit(root, job, self.dry_run, self.credentials()) {
+            self.fail("后台线程已停止，请重启程序");
+        }
+    }
+
+    /// 把未保存的密钥与项目配置写下去。返回 false 表示保存失败，任务不该继续。
+    fn flush_pending_edits(&mut self) -> bool {
+        if self.keys_dirty {
+            match self.settings.save() {
+                Ok(()) => {
+                    self.keys_dirty = false;
+                    self.push_console(Level::Info, "已自动保存密钥");
+                }
+                Err(err) => {
+                    self.fail(format!("保存密钥失败：{err:#}"));
+                    return false;
+                }
+            }
+        }
+        if self.config_dirty {
+            let Some(root) = self.root() else {
+                return true;
+            };
+            self.config_draft.normalize();
+            let result = crate::model::Project::open(&root).and_then(|mut project| {
+                project.config = self.config_draft.clone();
+                project.save_config()
+            });
+            match result {
+                Ok(()) => {
+                    self.config_dirty = false;
+                    self.push_console(Level::Info, "已自动保存项目配置（服务商 / 模型改动）");
+                }
+                Err(err) => {
+                    self.fail(format!("保存项目配置失败：{err:#}"));
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Probe jobs are allowed without an open project.
     pub fn submit_probe(&mut self, runtime: &Runtime, job: Job) {
         if self.is_busy() {
             self.fail("已有任务在运行，请先等待或取消");
+            return;
+        }
+        if !self.flush_pending_edits() {
             return;
         }
         let root = self

@@ -61,7 +61,12 @@ fn toolbar(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
 
     let mut job: Option<Job> = None;
     ui.horizontal_wrapped(|ui| {
-        if widgets::primary_button(ui, "运行拆解", !busy) {
+        let label = if cx.state.dry_run {
+            "运行拆解（演练）"
+        } else {
+            "运行拆解"
+        };
+        if widgets::primary_button(ui, label, !busy) {
             job = Some(Job::Parse);
         }
         if status.is_approved() {

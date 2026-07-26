@@ -127,9 +127,11 @@ pub fn platform_asset_name() -> &'static str {
     }
 }
 
-fn client() -> Result<reqwest::Client> {
+fn client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(timeout)
+        // 连不上 GitHub 的网络不少见，检查更新不该让人等。
+        .connect_timeout(Duration::from_secs(8))
         .user_agent(concat!("adrama/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("创建 HTTP 客户端失败")
@@ -147,7 +149,7 @@ pub async fn check() -> Result<UpdateStatus> {
 
 pub async fn latest_release() -> Result<ReleaseInfo> {
     let url = format!("{API_URL}/{REPO}/releases/latest");
-    let response = client()?
+    let response = client(Duration::from_secs(20))?
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -256,7 +258,8 @@ pub async fn download_and_apply(
 
 async fn download(url: &str, expected_size: u64, on_progress: &impl Fn(u64, u64)) -> Result<Vec<u8>> {
     check_host(url)?;
-    let mut response = client()?
+    // 下载可能很大，给足时间。
+    let mut response = client(Duration::from_secs(600))?
         .get(url)
         .send()
         .await

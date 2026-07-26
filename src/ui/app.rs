@@ -150,6 +150,7 @@ impl AdramaApp {
                         self.state.refresh(&self.runtime);
                     }
 
+                    self.dry_run_badge(ui);
                     self.update_badge(ui);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -159,6 +160,21 @@ impl AdramaApp {
             });
 
         self.banner(ctx);
+    }
+
+    /// 演练模式很容易忘了关，忘了就会「跑完但什么都没生成」。
+    fn dry_run_badge(&mut self, ui: &mut egui::Ui) {
+        if !self.state.dry_run {
+            return;
+        }
+        let clicked = widgets::pill(ui, "演练模式 · 不会调用模型", theme::WARNING)
+            .interact(egui::Sense::click())
+            .on_hover_text("点击退出演练模式")
+            .clicked();
+        if clicked {
+            self.state.dry_run = false;
+            self.state.persist_ui_prefs();
+        }
     }
 
     /// 有新版本时在顶栏挂一个可点的徽标。
