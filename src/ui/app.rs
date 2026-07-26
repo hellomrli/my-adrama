@@ -73,7 +73,13 @@ impl AdramaApp {
 impl eframe::App for AdramaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_updates();
+        self.state.watch_for_stalls();
         self.thumbs.begin_frame();
+
+        // 有任务在排队时保持重绘，否则卡住的提示要等下次交互才出现。
+        if self.state.is_busy() || self.state.updates.checking {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
 
         if self.state.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(120));

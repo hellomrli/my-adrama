@@ -109,6 +109,11 @@ impl AppSettings {
         PathBuf::from("adrama-settings.json")
     }
 
+    /// 运行日志的位置（图形界面看不到 stderr，出问题时这是唯一线索）。
+    pub fn log_path() -> PathBuf {
+        Self::config_path().with_file_name("adrama.log")
+    }
+
     pub fn load() -> Self {
         let path = Self::config_path();
         let mut settings: Self = fs::read_to_string(&path)

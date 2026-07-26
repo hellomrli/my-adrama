@@ -217,6 +217,9 @@ pub struct AppState {
     pub preview: Option<PathBuf>,
     pub dry_run: bool,
     pub updates: UpdateState,
+    /// 任务已提交但后台还没开始的时刻——用来在卡住时喊一声。
+    pending_since: Option<Instant>,
+    pending_warned: bool,
     /// Files a running job just wrote; the app drops their cached textures so
     /// a regenerated image appears immediately.
     pub dirty_thumbs: Vec<PathBuf>,
@@ -266,6 +269,8 @@ impl AppState {
             preview: None,
             dry_run,
             updates: UpdateState::default(),
+            pending_since: None,
+            pending_warned: false,
             dirty_thumbs: Vec::new(),
         }
     }
@@ -390,6 +395,8 @@ impl AppState {
     fn apply_event(&mut self, event: StageEvent) {
         match event {
             StageEvent::Started { label } => {
+                self.pending_since = None;
+                self.pending_warned = false;
                 self.live_status.clear();
                 self.busy = Some(Busy {
                     label: label.clone(),
@@ -415,6 +422,7 @@ impl AppState {
             StageEvent::Artifact { path } => self.dirty_thumbs.push(path),
             StageEvent::Finished { ok, message } => {
                 self.busy = None;
+                self.pending_since = None;
                 self.push_console(
                     if ok { Level::Info } else { Level::Error },
                     format!("{} {message}", if ok { "✔" } else { "✖" }),
@@ -554,8 +562,24 @@ impl AppState {
             );
         }
 
-        if !runtime.submit(root, job, self.dry_run, self.credentials()) {
+        if runtime.submit(root, job, self.dry_run, self.credentials()) {
+            self.pending_since = Some(Instant::now());
+            self.pending_warned = false;
+        } else {
             self.fail("后台线程已停止，请重启程序");
+        }
+    }
+
+    /// 每帧调用：任务迟迟没开始就说出来，别让人对着不动的界面猜。
+    pub fn watch_for_stalls(&mut self) {
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
+        let stalled = self
+            .pending_since
+            .map(|at| at.elapsed() > PATIENCE)
+            .unwrap_or(false);
+        if stalled && !self.pending_warned {
+            self.pending_warned = true;
+            self.fail("任务提交后 3 秒仍未开始：后台可能被别的请求占住了，或线程已退出。可重启程序，并把「设置 → 关于与更新 → 自检」的内容发出来。");
         }
     }
 
@@ -673,5 +697,111 @@ impl AppState {
         self.settings.ui.dry_run = self.dry_run;
         self.settings.ui.last_view = Some(self.view.key());
         let _ = self.settings.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AspectRatio, Breakdown, Project, Shot};
+    use std::time::Duration;
+
+    fn project(dir: &std::path::Path) -> Project {
+        let project = Project::create(dir, "t", "s", AspectRatio::Landscape).unwrap();
+        project.write_script("场景一\n内景 旧书店 傍晚").unwrap();
+        project
+            .save_breakdown(&Breakdown {
+                title: "t".into(),
+                shots: vec![Shot {
+                    id: "shot_1".into(),
+                    scene_id: "sc".into(),
+                    number: 1,
+                    framing: "中景".into(),
+                    camera: "固定".into(),
+                    visual: "画面".into(),
+                    dialogue: String::new(),
+                    sfx: String::new(),
+                    duration_secs: 5,
+                    character_ids: vec![],
+                    prop_ids: vec![],
+                    location_id: None,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        project
+    }
+
+    fn state_with(project: &Project) -> (AppState, Runtime) {
+        let runtime = Runtime::spawn(eframe::egui::Context::default());
+        let mut state = AppState::new(crate::settings::AppSettings::default());
+        state.open_project(&runtime, &project.root);
+        // 等第一次扫描回来，snapshot 就位后才谈得上提交任务
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.snapshot.is_none() && std::time::Instant::now() < deadline {
+            while let Ok(update) = runtime.rx.try_recv() {
+                state.apply(update);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (state, runtime)
+    }
+
+    fn pump(state: &mut AppState, runtime: &Runtime, secs: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            while let Ok(update) = runtime.rx.try_recv() {
+                state.apply(update);
+            }
+            if state.console.iter().any(|l| l.text.starts_with('✔') || l.text.starts_with('✖')) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 「点了运行没反应」的根因之一是任何一步失败都可能悄无声息。
+    /// 提交后控制台必须立刻有记录，随后必须收到一条结束消息——成功或失败都行，
+    /// 就是不能什么都没有。
+    #[test]
+    fn submitting_a_job_always_leaves_a_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = project(&tmp.path().join("p"));
+        let (mut state, runtime) = state_with(&project);
+        assert!(state.snapshot.is_some(), "项目应当已加载");
+
+        state.submit(&runtime, crate::engine::Job::Parse);
+        assert!(
+            state.console.iter().any(|l| l.text.contains("已提交")),
+            "提交任务后控制台必须立刻留痕"
+        );
+
+        pump(&mut state, &runtime, 10);
+        // 没配密钥，所以这里必然失败——重点是它必须“说话”
+        assert!(
+            state.console.iter().any(|l| l.text.starts_with('✖')),
+            "任务结束必须有结论，控制台内容：{:?}",
+            state.console.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(!state.is_busy(), "结束后不能一直停在「运行中」");
+    }
+
+    /// 演练模式下不该发出任何网络请求，但同样要有清楚的结论。
+    #[test]
+    fn dry_run_completes_without_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = project(&tmp.path().join("p"));
+        let (mut state, runtime) = state_with(&project);
+        state.dry_run = true;
+
+        state.submit(&runtime, crate::engine::Job::Parse);
+        pump(&mut state, &runtime, 10);
+
+        assert!(
+            state.console.iter().any(|l| l.text.contains("演练")),
+            "演练模式必须明说自己没有调用模型：{:?}",
+            state.console.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(!state.is_busy());
     }
 }

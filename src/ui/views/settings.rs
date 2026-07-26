@@ -626,6 +626,167 @@ fn about(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     if let Some(url) = open_page {
         widgets::open_url(&url);
     }
+
+    ui.add_space(theme::SPACE_SM);
+    self_check(ui, cx);
+}
+
+/// 出问题时的一站式现场信息：把该看的都摆出来，省得来回问。
+fn self_check(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
+    let report = diagnostics(cx);
+    let mut run_check = false;
+    let mut copy = false;
+
+    theme::card().show(ui, |ui| {
+        widgets::section_title(ui, "自检");
+        widgets::hint(ui, "遇到「点了没反应」时，先看这里，再把内容发出来。");
+        ui.add_space(theme::SPACE_SM);
+
+        for (ok, line) in &report.rows {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if *ok { "✔" } else { "!" })
+                        .color(if *ok { theme::SUCCESS } else { theme::WARNING }),
+                );
+                ui.label(RichText::new(line).small().color(theme::TEXT_MUTED));
+            });
+        }
+
+        ui.add_space(theme::SPACE_SM);
+        ui.horizontal_wrapped(|ui| {
+            if widgets::primary_button(ui, "运行自检（演练，不花钱）", !cx.state.is_busy()) {
+                run_check = true;
+            }
+            if widgets::button(ui, "复制诊断信息", true) {
+                copy = true;
+            }
+            if widgets::button(ui, "打开日志文件", AppSettings::log_path().is_file()) {
+                widgets::open_path(&AppSettings::log_path());
+            }
+        });
+        widgets::hint(ui, &format!("日志：{}", AppSettings::log_path().display()));
+    });
+
+    if run_check {
+        cx.state.console_open = true;
+        cx.state.push_console(
+            crate::engine::events::Level::Info,
+            "自检：提交一次演练拆解，只组装 prompt，不会调用模型",
+        );
+        let was_dry = cx.state.dry_run;
+        cx.state.dry_run = true;
+        cx.state.submit(cx.runtime, Job::Parse);
+        cx.state.dry_run = was_dry;
+    }
+    if copy {
+        ui.ctx().copy_text(report.text);
+        cx.state.note("诊断信息已复制到剪贴板");
+    }
+}
+
+struct Diagnostics {
+    rows: Vec<(bool, String)>,
+    text: String,
+}
+
+fn diagnostics(cx: &ViewCtx<'_>) -> Diagnostics {
+    let state = &cx.state;
+    let mut rows: Vec<(bool, String)> = Vec::new();
+
+    rows.push((
+        true,
+        format!(
+            "版本 {} · {}",
+            update::CURRENT_VERSION,
+            state.updates.install.describe()
+        ),
+    ));
+    rows.push((
+        !state.dry_run,
+        if state.dry_run {
+            "演练模式开着：只会展示 prompt，不会调用模型".into()
+        } else {
+            "演练模式已关闭".to_string()
+        },
+    ));
+    rows.push((
+        !state.is_busy(),
+        if state.is_busy() {
+            "有任务正在运行，运行按钮此时是禁用的".into()
+        } else {
+            "后台空闲，可以提交任务".to_string()
+        },
+    ));
+
+    match &state.snapshot {
+        None => rows.push((false, "尚未打开项目".into())),
+        Some(snapshot) => {
+            rows.push((true, format!("项目 {}", snapshot.root.display())));
+            match &snapshot.script_path {
+                Some(path) => rows.push((
+                    true,
+                    format!(
+                        "剧本 {}（{} 字）",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        snapshot.script_text.chars().count()
+                    ),
+                )),
+                None => rows.push((false, "script/ 下没有剧本文件，拆解无从开始".into())),
+            }
+        }
+    }
+
+    let credentials = state.credentials();
+    for cap in Capability::ALL {
+        let endpoint = state.config_draft.endpoint(cap);
+        let has_key = credentials.has(cap, endpoint.provider, endpoint.mode);
+        let supported = endpoint.provider.supports(cap);
+        rows.push((
+            has_key && supported && !endpoint.model.is_empty(),
+            format!(
+                "{}：{} · {} · {} · {}",
+                capability_title(cap),
+                endpoint.provider.label(),
+                endpoint.mode.label(),
+                if endpoint.model.is_empty() {
+                    "未设置模型"
+                } else {
+                    &endpoint.model
+                },
+                if !supported {
+                    "该服务商不提供此能力"
+                } else if has_key {
+                    "密钥已配置"
+                } else {
+                    "缺少密钥"
+                }
+            ),
+        ));
+        rows.push((true, format!("    地址 {}", endpoint.base_url)));
+    }
+
+    if state.config_dirty || state.keys_dirty {
+        rows.push((false, "有改动尚未保存（运行任务时会自动保存）".into()));
+    }
+
+    let mut text = String::from("adrama 诊断信息\n");
+    for (ok, line) in &rows {
+        text.push_str(&format!("{} {line}\n", if *ok { "[ok]" } else { "[!]" }));
+    }
+    text.push_str("\n最近日志：\n");
+    for line in state
+        .console
+        .iter()
+        .rev()
+        .take(25)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        text.push_str(&format!("  {}\n", line.text));
+    }
+
+    Diagnostics { rows, text }
 }
 
 fn human_size(bytes: u64) -> String {
