@@ -144,6 +144,53 @@ pub fn secret_field(
     changed
 }
 
+/// 「正在跑」的状态条：放在阶段页面顶部，用户点完按钮就在原地看得到反馈。
+/// 返回 true 表示点了取消。
+pub fn running_strip(
+    ui: &mut Ui,
+    label: &str,
+    detail: Option<&str>,
+    elapsed: std::time::Duration,
+    progress: Option<(u32, u32)>,
+) -> bool {
+    let mut cancel = false;
+    egui::Frame::new()
+        .fill(theme::tint(theme::INFO, 26))
+        .stroke(Stroke::new(1.0_f32, theme::tint(theme::INFO, 110)))
+        .corner_radius(theme::RADIUS_MD)
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(label).strong().color(theme::TEXT));
+                ui.label(
+                    RichText::new(format!("{} 秒", elapsed.as_secs()))
+                        .small()
+                        .monospace()
+                        .color(theme::TEXT_DIM),
+                );
+                if let Some((done, total)) = progress {
+                    if total > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(done as f32 / total as f32)
+                                .desired_width(160.0)
+                                .text(format!("{done}/{total}")),
+                        );
+                    }
+                }
+                if let Some(detail) = detail {
+                    ui.label(RichText::new(detail).color(theme::INFO));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if danger_button(ui, "取消", true) {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+    cancel
+}
+
 /// Thin horizontal meter used for stage completion.
 pub fn meter(ui: &mut Ui, ratio: f32, color: Color32, width: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 6.0), Sense::hover());

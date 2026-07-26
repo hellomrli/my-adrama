@@ -26,6 +26,7 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>, stage: Stage) {
     }
 
     toolbar(ui, cx, stage);
+    crate::ui::views::running_banner(ui, cx);
     ui.add_space(theme::SPACE_SM);
 
     let items: Vec<ItemView> = cx.state.items(stage).to_vec();

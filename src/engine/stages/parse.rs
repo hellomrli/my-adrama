@@ -38,8 +38,40 @@ pub async fn run(ctx: &StageCtx<'_>) -> Result<Breakdown> {
     let provider = ctx.factory().chat()?;
     ctx.events
         .info(format!("调用 {} 解析剧本…", provider.endpoint()));
-    ctx.events.progress(0, 1, "等待模型返回");
+    ctx.events
+        .progress(0, 0, "已发出请求，等待模型开始输出…");
     ctx.check_cancel()?;
+
+    // 把流式接收情况实时报出去：否则长剧本 + 慢模型看起来就像卡死了。
+    let events = ctx.events.clone();
+    let last_log = std::sync::Mutex::new(std::time::Instant::now());
+    let on_progress = move |p: crate::providers::http::SseProgress| {
+        let detail = if p.chars > 0 {
+            format!(
+                "接收中 {} 字 · 已用 {} 秒",
+                p.chars,
+                p.elapsed.as_secs()
+            )
+        } else if p.thinking > 0 {
+            format!("模型思考中 {} 段 · 已用 {} 秒", p.thinking, p.elapsed.as_secs())
+        } else {
+            format!("已连接 {} 段 · 已用 {} 秒", p.events, p.elapsed.as_secs())
+        };
+        events.progress(0, 0, detail);
+
+        // 控制台里每 5 秒留一条，跑长任务时能看出是在动还是真卡住了。
+        if let Ok(mut last) = last_log.lock() {
+            if last.elapsed() >= std::time::Duration::from_secs(5) {
+                *last = std::time::Instant::now();
+                events.info(format!(
+                    "… 接收中：{} 字 / {} 段（{} 秒）",
+                    p.chars,
+                    p.events,
+                    p.elapsed.as_secs()
+                ));
+            }
+        }
+    };
 
     let value = provider
         .complete_json(ChatJsonRequest {
@@ -47,6 +79,7 @@ pub async fn run(ctx: &StageCtx<'_>) -> Result<Breakdown> {
             user: &user,
             schema_name: "breakdown",
             schema: &schema,
+            on_progress: Some(&on_progress),
         })
         .await?;
 

@@ -72,7 +72,7 @@ impl OpenAiCompatible {
 
     /// 发一次对话请求。走流式：长剧本 + 慢模型经常要一两分钟，非流式会被
     /// 网关（Cloudflare 默认 100 秒）判成 524。
-    async fn chat_once(&self, label: &str, body: Value) -> Result<Value> {
+    async fn chat_once(&self, label: &str, body: Value, req: &ChatJsonRequest<'_>) -> Result<Value> {
         let url = self.url("chat/completions");
         let text = self
             .http
@@ -85,11 +85,11 @@ impl OpenAiCompatible {
                         .bearer_auth(&self.api_key)
                         .json(&body)
                 },
-                |chunk| {
-                    chunk
-                        .pointer("/choices/0/delta/content")
-                        .and_then(|c| c.as_str())
-                        .map(str::to_string)
+                extract_delta,
+                |progress| {
+                    if let Some(report) = req.on_progress {
+                        report(progress);
+                    }
                 },
             )
             .await?;
@@ -204,7 +204,10 @@ impl ChatProvider for OpenAiCompatible {
 
     fn complete_json<'a>(&'a self, req: ChatJsonRequest<'a>) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
-            let strict_err = match self.chat_once("对话请求", self.strict_body(&req)).await {
+            let strict_err = match self
+                .chat_once("对话请求", self.strict_body(&req), &req)
+                .await
+            {
                 Ok(value) => return Ok(value),
                 Err(err) => err,
             };
@@ -216,7 +219,7 @@ impl ChatProvider for OpenAiCompatible {
             }
 
             tracing::info!("json_schema 模式被拒绝（{strict_err}），改用 json_object 模式");
-            self.chat_once("对话请求（兼容模式）", self.loose_body(&req))
+            self.chat_once("对话请求（兼容模式）", self.loose_body(&req), &req)
                 .await
                 .map_err(|loose_err| {
                     anyhow!("结构化输出失败：{strict_err}；兼容模式亦失败：{loose_err}")
@@ -260,6 +263,23 @@ pub async fn list_models(http: &Http, base: &str, key: &str) -> Result<Vec<Strin
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// 不同中转的分片字段不尽相同：标准是 `delta.content`，也有直接给整条
+/// `message.content` 或老式 `text` 的。思维链（`reasoning_content`）不算正文。
+fn extract_delta(chunk: &Value) -> Option<String> {
+    for pointer in [
+        "/choices/0/delta/content",
+        "/choices/0/message/content",
+        "/choices/0/text",
+    ] {
+        if let Some(text) = chunk.pointer(pointer).and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 只有「上游明确不接受这个请求体」或「返回的内容不是合法 JSON」才值得换兼容模式。
@@ -315,6 +335,29 @@ fn mime_for(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_extraction_covers_common_relay_shapes() {
+        // 标准
+        assert_eq!(
+            extract_delta(&json!({"choices":[{"delta":{"content":"你好"}}]})).as_deref(),
+            Some("你好")
+        );
+        // 有些中转直接给整条 message
+        assert_eq!(
+            extract_delta(&json!({"choices":[{"message":{"content":"完整"}}]})).as_deref(),
+            Some("完整")
+        );
+        // 老式 completions
+        assert_eq!(
+            extract_delta(&json!({"choices":[{"text":"旧式"}]})).as_deref(),
+            Some("旧式")
+        );
+        // 思维链不算正文
+        assert!(extract_delta(&json!({"choices":[{"delta":{"reasoning_content":"想想"}}]})).is_none());
+        // 空分片（心跳）
+        assert!(extract_delta(&json!({"choices":[{"delta":{}}]})).is_none());
+    }
 
     #[test]
     fn fences_are_stripped() {

@@ -7,6 +7,18 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::warn;
 
+/// 流式接收的实时情况：用来告诉用户「数据在回来」还是「一直没动静」。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SseProgress {
+    /// 收到的 data 段数。
+    pub events: usize,
+    /// 已累积的正文字数。
+    pub chars: usize,
+    /// 只有思维链、还没有正文的段数（推理模型常见）。
+    pub thinking: usize,
+    pub elapsed: Duration,
+}
+
 /// 带状态码的失败，调用方据此判断「换个方式重来」还是「直接放弃」。
 #[derive(Debug)]
 pub struct HttpError {
@@ -143,11 +155,12 @@ impl Http {
         label: &str,
         make: impl Fn() -> RequestBuilder,
         extract: impl Fn(&Value) -> Option<String>,
+        on_progress: impl Fn(SseProgress),
     ) -> Result<String> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.stream_once(&make, &extract).await {
+            match self.stream_once(&make, &extract, &on_progress).await {
                 Ok(text) => return Ok(text),
                 Err(err) => {
                     if !err.retryable || attempt >= self.retries {
@@ -171,7 +184,10 @@ impl Http {
         &self,
         make: &impl Fn() -> RequestBuilder,
         extract: &impl Fn(&Value) -> Option<String>,
+        on_progress: &impl Fn(SseProgress),
     ) -> std::result::Result<String, Attempt> {
+        let started = std::time::Instant::now();
+        let mut progress = SseProgress::default();
         let mut response = make().send().await.map_err(|e| {
             Attempt::transport(
                 None,
@@ -216,9 +232,16 @@ impl Http {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(data) {
-                    if let Some(delta) = extract(&value) {
-                        text.push_str(&delta);
+                    progress.events += 1;
+                    match extract(&value) {
+                        Some(delta) => text.push_str(&delta),
+                        // 推理模型会先吐一大段思维链，正文要等后面才来。
+                        None if is_thinking(&value) => progress.thinking += 1,
+                        None => {}
                     }
+                    progress.chars = text.chars().count();
+                    progress.elapsed = started.elapsed();
+                    on_progress(progress);
                 }
             }
         }
@@ -234,6 +257,24 @@ impl Http {
                 Some(status.as_u16()),
                 true,
                 "上游返回了空响应".into(),
+            ));
+        }
+        if progress.events > 0 {
+            // 收到了流式分片却一个字正文都没有——多半是字段名不一样。
+            return Err(Attempt::transport(
+                Some(status.as_u16()),
+                false,
+                format!(
+                    "上游返回了 {} 段流式数据但没有正文{}；\
+                     该中转的字段可能与 OpenAI 不一致，可在设置里换一个模型试试。原文：{}",
+                    progress.events,
+                    if progress.thinking > 0 {
+                        format!("（其中 {} 段只有思维链）", progress.thinking)
+                    } else {
+                        String::new()
+                    },
+                    self.redact(&preview(&body))
+                ),
             ));
         }
         Ok(body)
@@ -289,6 +330,13 @@ impl Attempt {
             message,
         }
     }
+}
+
+/// 推理模型的思维链分片：算「有动静」，但不是正文。
+fn is_thinking(chunk: &Value) -> bool {
+    ["/choices/0/delta/reasoning_content", "/choices/0/delta/reasoning"]
+        .iter()
+        .any(|p| chunk.pointer(p).map(|v| !v.is_null()).unwrap_or(false))
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {

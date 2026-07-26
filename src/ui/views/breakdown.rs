@@ -21,6 +21,9 @@ pub fn show(ui: &mut Ui, cx: &mut ViewCtx<'_>) {
     }
 
     toolbar(ui, cx);
+    if crate::ui::views::running_banner(ui, cx) {
+        return;
+    }
     ui.add_space(theme::SPACE_SM);
 
     let has_breakdown = cx

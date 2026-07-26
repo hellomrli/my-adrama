@@ -31,6 +31,8 @@ pub struct ChatJsonRequest<'a> {
     pub user: &'a str,
     pub schema_name: &'a str,
     pub schema: &'a Value,
+    /// 流式接收进度回调——让用户看得见「数据在回来」还是「一直没动静」。
+    pub on_progress: Option<&'a (dyn Fn(http::SseProgress) + Send + Sync)>,
 }
 
 /// Structured-output text model.

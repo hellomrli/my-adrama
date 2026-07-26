@@ -194,6 +194,11 @@ impl ChatProvider for GoogleClient {
                             .collect();
                         (!joined.is_empty()).then_some(joined)
                     },
+                    |progress| {
+                        if let Some(report) = req.on_progress {
+                            report(progress);
+                        }
+                    },
                 )
                 .await?;
 
